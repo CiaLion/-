@@ -1,0 +1,14 @@
+# 《异键演奏》主程序依赖（transcriber/ 与 player/ 共用）
+#
+# 安装（国内镜像）：
+#   python -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+#
+# 注意：SheetSage2 / MERT 模型权重不在这里，它们已经放在 vendor\sheetsage2\models\ 下；
+#       XPU 推理环境是 vendor\sheetsage2\.venv，由 setup\setup_env.ps1 单独处理。
+
+numpy==2.1.3
+mido==1.3.3
+pretty_midi==0.2.11.post0
+PyQt5==5.15.11
+SoundCard==0.4.6
+Pillow==12.3.0

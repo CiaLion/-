@@ -1,0 +1,11 @@
+Third-Party Model Weights
+
+The source code of this project is licensed under the MIT License (see LICENSE).
+
+The external AI model weights used by the optional audio transcription feature
+(SheetSage2 and MERT-v2-FullSong) are not included in this repository. They are
+distributed by their original authors under CC BY-NC 4.0 (Non-Commercial), and
+any use of those weights is governed by that license.
+
+The bundled acoustic samples, fonts and other assets remain under the terms
+listed in the licenses/ directory.

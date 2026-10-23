@@ -1,0 +1,42 @@
+# ---- 虚拟环境：不可移植，由 setup/setup_env.ps1 现场创建 ----
+.venv/
+*.venv/
+vendor/sheetsage2/.venv/
+
+# ---- 模型权重：体积约 2.6GB，不入库 ----
+vendor/sheetsage2/models/
+models/
+*.safetensors
+*.part
+
+# ---- 运行时产物 ----
+out/
+logs/
+录像/
+录音/
+
+# ---- 本机私有配置 ----
+config.local.json
+gui_settings.json*
+transcriber/gui_settings.json
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# ---- 便携运行时 / 发布产物（完整包里有，源码仓库不提交） ----
+runtime/
+RELEASE_REPORT.md
+transcriber/out/
+
+# ---- 用户录音 / 启动日志 ----
+player/录音/
+player/录像/
+启动日志-*.txt
+error-*.log
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

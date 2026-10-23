@@ -1,0 +1,25 @@
+{
+  "_说明": "所有外部路径集中在这里。相对路径 = 相对本文件所在目录（项目根）；也可以直接写绝对路径覆盖。环境变量 YIHUAN_* 优先级最高。本机私有路径请放同目录的 config.local.json（已在 .gitignore，存在时自动合并）。",
+
+  "sheetsage2": {
+    "_说明": "SheetSage2 的代码目录、推理用 Python 与 CLI 脚本。python 不存在时按 python_fallbacks 依次回退。",
+    "home": "vendor/sheetsage2",
+    "python": "vendor/sheetsage2/.venv/Scripts/python.exe",
+    "python_fallbacks": [],
+    "cli": "vendor/sheetsage2/transcribe_cli.py"
+  },
+
+  "ffmpeg": {
+    "_说明": "ffmpeg / ffplay 所在目录。dir 为空时会自动在系统 PATH 里找。",
+    "dir": "",
+    "ffmpeg": "",
+    "ffplay": ""
+  },
+
+  "runtime": {
+    "_说明": "推理设备与单步超时（秒）。device 可选 auto / xpu / cuda / cpu。",
+    "device": "auto",
+    "dtype": "bf16",
+    "timeout_sec": 3600
+  }
+}

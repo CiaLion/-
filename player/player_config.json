@@ -1,0 +1,30 @@
+{
+  "wheel_x_ratio": 0.6937,
+  "wheel_y_ratio": 0.4378,
+  "wheel_radius_ratio": 0.2655365716828123,
+  "speed": 1.0,
+  "mode": "fret",
+  "transpose": 0,
+  "enable_arpeggio": false,
+  "enable_chord_rhythm": true,
+  "timing": {
+    "min_action_interval": 0.02,
+    "fret_click_hold": 0.028,
+    "pluck_hold": 0.028,
+    "sustain_max": 4.0,
+    "select_click_hold": 0.028,
+    "strum_park_wait": 0.02,
+    "strum_click_hold": 0.03,
+    "strum_hold": 0.0,
+    "page_key_hold": 0.028,
+    "page_turn_gap": 0.025,
+    "after_page_key_release": 0.035,
+    "settle_after_page_turn": 0.0,
+    "settle_same_page": 0.0,
+    "settle_page_turn": 0.0,
+    "sustain_min": 0.3,
+    "repluck_gap": 0.028,
+    "start_delay": 3.0,
+    "preschedule_lead": 0.0
+  }
+}
