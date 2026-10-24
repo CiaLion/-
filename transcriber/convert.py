@@ -162,6 +162,197 @@ class ChordSlice:
         return self.end_sec - self.start_sec
 
 
+# ---------------------------------------------------------------------------
+# v3：SheetSage2 原生 `chord.lab` / `beat.lab` 纯 Python 直读
+# ---------------------------------------------------------------------------
+# 音名 → 音级（与 Harte 语法一致，大小写敏感度由调用方归一）
+NOTE_TO_PC: Dict[str, int] = {
+    "C": 0, "C#": 1, "Db": 1, "D": 2, "D#": 3, "Eb": 3, "E": 4, "F": 5,
+    "F#": 6, "Gb": 6, "G": 7, "G#": 8, "Ab": 8, "A": 9, "A#": 10, "Bb": 10,
+    "B": 11, "Cb": 11, "E#": 5, "B#": 0, "Fb": 4,
+}
+
+# 品质 → 相对根音的半音音程表（含四音扩展色彩：6 / 7 / maj7 / sus4）
+QUALITY_INTERVALS: Dict[str, Tuple[int, ...]] = {
+    "maj": (0, 4, 7),
+    "min": (0, 3, 7),
+    "dim": (0, 3, 6),
+    "aug": (0, 4, 8),
+    "sus4": (0, 5, 7),
+    "sus2": (0, 2, 7),
+    "7": (0, 4, 7, 10),
+    "maj7": (0, 4, 7, 11),
+    "min7": (0, 3, 7, 10),
+    "minmaj7": (0, 3, 7, 11),
+    "dim7": (0, 3, 6, 9),
+    "hdim7": (0, 3, 6, 10),
+    "maj6": (0, 4, 7, 9),
+    "min6": (0, 3, 7, 9),
+    "9": (0, 4, 7, 10, 2),
+    "maj9": (0, 4, 7, 11, 2),
+    "min9": (0, 3, 7, 10, 2),
+}
+
+# 别名（SheetSage2 偶发写法 / 人工改写）→ 上表的标准品质名
+QUALITY_ALIASES: Dict[str, str] = {
+    "": "maj", "M": "maj", "major": "maj",
+    "m": "min", "minor": "min", "-": "min",
+    "dom7": "7", "m7": "min7", "M7": "maj7", "ma7": "maj7",
+    "min/maj7": "minmaj7", "mmaj7": "minmaj7", "mM7": "minmaj7",
+    "ø7": "hdim7", "half-dim7": "hdim7", "m7b5": "hdim7",
+    "o7": "dim7", "add9": "maj", "5": "maj", "6": "maj6", "m6": "min6",
+}
+
+# 斜杠转位度数 → 相对根音的半音数
+DEGREE_TO_SEMITONES: Dict[str, int] = {
+    "1": 0, "b2": 1, "2": 2, "#2": 3, "b3": 3, "3": 4, "4": 5, "#4": 6,
+    "b5": 6, "5": 7, "#5": 8, "b6": 8, "6": 9, "bb7": 9, "b7": 10, "7": 11,
+}
+
+CHORD_LAB_SKIP = {"N", "X", "?"}
+CHORD_LAB_REARTICULATE_SEC = 2.5      # 超过这个时长的和弦在小节线内重触发
+
+
+def parse_chord_label(label: str) -> Optional[Tuple[int, Tuple[int, ...], int]]:
+    """Harte 标签 → `(root_pc, intervals, bass_pc)`；无法解析返回 None。
+
+    支持 `<Root>:<Quality>[/<BassInterval>]`，例如 `C#:min`、`E:maj6`、
+    `C#:min7/b3`、`A:maj/2`。`N / X / ?` 一律跳过。
+    """
+    text = (label or "").strip()
+    if not text or text in CHORD_LAB_SKIP:
+        return None
+    text = text.replace("♯", "#").replace("♭", "b")
+
+    bass_tok = None
+    if "/" in text:
+        text, bass_tok = text.split("/", 1)
+        bass_tok = bass_tok.strip()
+        text = text.strip()
+
+    if ":" in text:
+        root_txt, quality_txt = text.split(":", 1)
+    else:
+        root_txt, quality_txt = text, ""
+    root_txt = root_txt.strip()
+    quality_txt = quality_txt.strip()
+
+    root_pc = NOTE_TO_PC.get(root_txt)
+    if root_pc is None and root_txt:
+        root_pc = NOTE_TO_PC.get(root_txt[0].upper() + root_txt[1:])
+    if root_pc is None:
+        return None
+
+    key = quality_txt.lower()
+    intervals = QUALITY_INTERVALS.get(key)
+    if intervals is None:
+        alias = QUALITY_ALIASES.get(quality_txt) or QUALITY_ALIASES.get(key)
+        intervals = QUALITY_INTERVALS.get(alias) if alias else None
+    if intervals is None:
+        # 未知品质：按大三和弦兜底，绝不因为标签怪异丢掉整片和弦
+        intervals = QUALITY_INTERVALS["maj"]
+
+    bass_pc = root_pc
+    if bass_tok:
+        semis = DEGREE_TO_SEMITONES.get(bass_tok.lower())
+        if semis is None:
+            named = NOTE_TO_PC.get(bass_tok) or NOTE_TO_PC.get(
+                bass_tok[:1].upper() + bass_tok[1:])
+            bass_pc = named if named is not None else root_pc
+        else:
+            bass_pc = (root_pc + semis) % 12
+    return root_pc, tuple(intervals), bass_pc
+
+
+def chord_label_to_pitches(label: str) -> List[int]:
+    """标签 → 三层音高布局（与 `midi_sheetsage2.chord_pitches` 完全一致）。
+
+    * Bass 层 `36..47`：`36 + bass_pc`（真实低音，含斜杠转位低音）；
+    * Root 层 `48..59`：`48 + root_pc`（和弦本位根音，供下游识别本名）；
+    * Upper 层：`60 + (root_pc + interval) % 12`，含 6 / 7 / maj7 / sus4 色彩音。
+    """
+    got = parse_chord_label(label)
+    if got is None:
+        return []
+    root_pc, intervals, bass_pc = got
+    pitches = [36 + int(bass_pc), 48 + int(root_pc)]
+    upper = {60 + (int(root_pc) + int(iv)) % 12
+             for iv in intervals if int(iv) % 12 != 0}
+    pitches.extend(sorted(upper))
+    return sorted(set(int(p) for p in pitches))
+
+
+def _read_beat_downbeats(beat_path: Optional[Union[str, Path]]) -> List[float]:
+    """读 `beat.lab`（每行 `time beat_num [num] [den]`）里的小节线时刻。"""
+    if not beat_path:
+        return []
+    path = Path(beat_path)
+    if not path.is_file():
+        return []
+    out: List[float] = []
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                when = float(parts[0])
+                beat_no = int(float(parts[1]))
+            except ValueError:
+                continue
+            if beat_no == 1:
+                out.append(round(when, 6))
+    except OSError:
+        return []
+    out.sort()
+    return out
+
+
+def parse_chord_lab_to_slices(
+    lab_path: Union[str, Path],
+    beat_path: Optional[Union[str, Path]] = None,
+) -> List[ChordSlice]:
+    """SheetSage2 `chord.lab` → `List[ChordSlice]`（纯 Python，不依赖 GPU / mir_eval）。
+
+    这样即使不重跑推理、只用现成的 `out/sheetsage2/chord.lab` 跑 step2 / step3，
+    也能 100% 拿到四音扩展和弦（`maj6 / min7 / maj7`）与斜杠转位低音（`/2, /b3`）。
+
+    跨小节长和弦（时长 > 2.5s）内部按 `beat.lab` 的 `beat_num == 1`（强拍小节线）
+    切分重触发，与 `midi_sheetsage2.build_playback` 的 downbeats 行为一致。
+    """
+    path = Path(lab_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到 chord.lab: {path}")
+    downbeats = _read_beat_downbeats(beat_path)
+
+    slices: List[ChordSlice] = []
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            start = float(parts[0])
+            end = float(parts[1])
+        except ValueError:
+            continue
+        label = parts[2].strip()
+        pitches = chord_label_to_pitches(label)
+        if not pitches:
+            continue
+        if end <= start:
+            continue
+        if (end - start) > CHORD_LAB_REARTICULATE_SEC and downbeats:
+            cuts = [start] + [d for d in downbeats if start + _EPS < d < end - _EPS] + [end]
+        else:
+            cuts = [start, end]
+        for a, b in zip(cuts, cuts[1:]):
+            if b - a <= _EPS:
+                continue
+            slices.append(ChordSlice(a, b, list(pitches)))
+    slices.sort(key=lambda s: (s.start_sec, s.end_sec))
+    return slices
+
+
 def notes_to_chord_slices(
     notes: Iterable[Note],
     *,
@@ -377,8 +568,13 @@ def write_midi(
     ticks_per_beat: int = DEFAULT_TPB,
     bpm: float = DEFAULT_BPM,
     tempo_bpm: Optional[float] = None,
+    text_events: Optional[Sequence[tuple]] = None,
 ) -> Path:
-    """把轨道写成 MIDI（默认 480 tpb；bpm 为真实速度，未给时 120 占位）。"""
+    """把轨道写成 MIDI（默认 480 tpb；bpm 为真实速度，未给时 120 占位）。
+
+    `text_events`：`[(秒, 文本)]`，写进 Track 0 的 Meta Text 事件。v3.1 用它承载
+    `P2_MODE:chord` / `P2_MODE:fret` 混切标记，另存后重新加载即可复原混切序列。
+    """
     if tempo_bpm:
         bpm = tempo_bpm
     path = Path(path)
@@ -409,6 +605,14 @@ def write_midi(
         program = max(0, min(127, int(track.program)))
         if program:
             add(0, 3, mido.Message("program_change", program=program, channel=0, time=0))
+
+        if t_idx == 0 and text_events:
+            for (when, text) in text_events:
+                try:
+                    add(sec_to_tick(float(when)), 2,
+                        mido.MetaMessage("text", text=str(text), time=0))
+                except Exception:
+                    continue
 
         for note in track.notes:
             if note.end_sec <= note.start_sec:

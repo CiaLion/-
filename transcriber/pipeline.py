@@ -1,22 +1,17 @@
 # -*- coding: utf-8 -*-
-"""《异键演奏》核心流水线（CLI 与图形界面共用）。
+"""《异键演奏》v1.1 核心扒谱流水线（CLI 与图形界面共用）。
 
 三步流水线：
   1. SheetSage2 音频转录
      输入：原始音频（mp3 / wav / flac / m4a ...）
      输出：melody_vocal.mid、melody_instrumental.mid、chords.mid
-           （以及 SheetSage2 原生产物 transcription.mid / events.json）
+           （以及 SheetSage2 原生产物 transcription.mid / events.json / chord.lab / beat.lab）
   2. 物理秒对齐 + 主旋律合并 + 和弦合并
-     输入：步骤 1 的三个 MIDI，或一个包含多轨的综合 MIDI
+     输入：步骤 1 的三个 MIDI（优先直读原生 chord.lab 保留四音和弦与转位低音），或一个综合 MIDI
      输出：main_melody.mid / main_melody.json、chords_merged.mid / chords.json
   3. 超音域修正 + 最终导出
      输入：main_melody.mid（+ chords_merged.mid）
      输出：<音频同名>.mid（Main Melody + Chords 两轨）
-
-设计约束：
-  * 所有时间一律使用绝对秒；输出 MIDI 统一 480 tpb / 120 BPM 占位；
-  * 每一步都是独立函数，可单独调用，也可从中间文件续跑；
-  * 主程序只依赖 pretty_midi / mido / numpy，不 import torch。
 """
 from __future__ import annotations
 
@@ -32,15 +27,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
-# 允许 `python pipeline.py` 与 GUI 以模块方式导入
 _THIS_DIR = Path(__file__).resolve().parent
 if str(_THIS_DIR) not in sys.path:
     sys.path.insert(0, str(_THIS_DIR))
 
-# 包导入走相对导入，脚本运行退回扁平导入（保证同一进程只有一份 convert）
 try:
     from . import convert as _convert  # noqa: E402
-except ImportError:  # 直接运行本文件
+except ImportError:
     import convert as _convert  # noqa: E402,F401
 
 sys.modules.setdefault("convert", _convert)
@@ -57,6 +50,7 @@ from convert import (  # noqa: E402
     count_chord_slice_pitches,
     flatten_notes,
     load_chords_json,
+    parse_chord_lab_to_slices,
     read_midi_tracks,
     read_notes_any,
     save_chords_json,
@@ -66,11 +60,6 @@ from convert import (  # noqa: E402
     write_midi,
 )
 
-# ---------------------------------------------------------------------------
-# 路径配置：全部集中在 config.json
-#   优先级：环境变量 YIHUAN_*  >  config.json  >  本项目 DEFAULT_CONFIG
-# ---------------------------------------------------------------------------
-# 本模块位于 <项目根>/transcriber/，配置、vendor、out 等一律相对项目根解析
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 CONFIG_NAME = "config.json"
 LOCAL_CONFIG_NAME = "config.local.json"
@@ -78,13 +67,11 @@ LOCAL_CONFIG_NAME = "config.local.json"
 DEFAULT_CONFIG: Dict[str, Any] = {
     "sheetsage2": {
         "home": "vendor/sheetsage2",
-        # 首选项目内 venv；不存在时按 python_fallbacks 依次回退
         "python": "vendor/sheetsage2/.venv/Scripts/python.exe",
         "python_fallbacks": [],
         "cli": "vendor/sheetsage2/transcribe_cli.py",
     },
     "ffmpeg": {
-        # 空字符串 = 自动（先用 PATH 里的 ffmpeg/ffplay）
         "dir": "",
         "ffmpeg": "",
         "ffplay": "",
@@ -112,18 +99,15 @@ ONSET_TOLERANCE = 0.030          # 和弦切片：起音相差 <=30ms 视为同�
 
 
 def config_file() -> Path:
-    """config.json 的位置；`YIHUAN_CONFIG` 可以把整份配置指到别处。"""
     raw = (os.environ.get("YIHUAN_CONFIG") or "").strip()
     return Path(raw).expanduser() if raw else (PROJECT_DIR / CONFIG_NAME)
 
 
 def local_config_file() -> Path:
-    """本机私有配置 config.local.json（可选，不入库）。"""
     return PROJECT_DIR / LOCAL_CONFIG_NAME
 
 
 def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> Dict[str, Any]:
-    """dict 递归合并：override 里没写的键保留 base 的默认值。"""
     out: Dict[str, Any] = {k: (dict(v) if isinstance(v, Mapping) else v) for k, v in base.items()}
     for key, value in override.items():
         if isinstance(value, Mapping) and isinstance(out.get(key), Mapping):
@@ -141,7 +125,6 @@ def _set_nested(data: Dict[str, Any], keys: Sequence[str], value: Any) -> None:
 
 
 def load_config() -> Dict[str, Any]:
-    """读 config.json + config.local.json（缺文件/坏 JSON 都不抛异常）并叠加环境变量。"""
     cfg = _deep_merge(DEFAULT_CONFIG, {})
     for path in (config_file(), local_config_file()):
         if not path.is_file():
@@ -162,7 +145,6 @@ def load_config() -> Dict[str, Any]:
 
 
 def _as_path(value: Any) -> Optional[Path]:
-    """相对路径按项目目录解析；空值返回 None。"""
     text = str(value or "").strip()
     if not text:
         return None
@@ -173,7 +155,6 @@ def _as_path(value: Any) -> Optional[Path]:
 
 
 def _pick_path(candidates: Sequence[Any]) -> Tuple[Optional[Path], int]:
-    """按顺序取第一个存在的路径；都不存在时返回第一个候选（便于报错）。"""
     paths = [_as_path(v) for v in candidates if str(v or "").strip()]
     paths = [p for p in paths if p is not None]
     if not paths:
@@ -193,7 +174,6 @@ def _source_label(index: int) -> str:
 
 
 def resolve_paths(cfg: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    """把配置解析成一组绝对路径（只检查是否存在，不检查能否跑起来）。"""
     cfg = load_config() if cfg is None else cfg
     s2 = cfg.get("sheetsage2") or {}
     ff = cfg.get("ffmpeg") or {}
@@ -264,6 +244,14 @@ SHEETSAGE2_HOME: Path = PATHS["sheetsage2"]["home"]
 SHEETSAGE2_PY: Path = PATHS["sheetsage2"]["python"]
 SHEETSAGE2_CLI: Path = PATHS["sheetsage2"]["cli"]
 MERT_DIR: Path = SHEETSAGE2_HOME / "models" / "MERT-v2-FullSong"
+SHEETSAGE2_MODEL_DIR: Path = SHEETSAGE2_HOME / "models" / "SheetSage2"
+FFMPEG_DIR: Optional[Path] = PATHS["ffmpeg"]["dir"]
+FFMPEG_EXE: Optional[Path] = PATHS["ffmpeg"]["ffmpeg"]
+FFPLAY_EXE: Optional[Path] = PATHS["ffmpeg"]["ffplay"]
+
+STEP_TIMEOUT = PATHS["runtime"]["timeout_sec"]
+DEFAULT_DEVICE = PATHS["runtime"]["device"]
+DEFAULT_DTYPE = PATHS["runtime"]["dtype"]
 
 
 class AIComponentsMissing(RuntimeError):
@@ -278,18 +266,9 @@ def ai_components_ready() -> bool:
         if not (SHEETSAGE2_HOME / "models" / name / "model.safetensors").exists():
             return False
     return True
-SHEETSAGE2_MODEL_DIR: Path = SHEETSAGE2_HOME / "models" / "SheetSage2"
-FFMPEG_DIR: Optional[Path] = PATHS["ffmpeg"]["dir"]
-FFMPEG_EXE: Optional[Path] = PATHS["ffmpeg"]["ffmpeg"]
-FFPLAY_EXE: Optional[Path] = PATHS["ffmpeg"]["ffplay"]
-
-STEP_TIMEOUT = PATHS["runtime"]["timeout_sec"]
-DEFAULT_DEVICE = PATHS["runtime"]["device"]
-DEFAULT_DTYPE = PATHS["runtime"]["dtype"]
 
 
 def describe_paths(paths: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
-    """把生效的路径摊平成可 JSON 序列化的 dict（写日志 / 交给 GUI 显示）。"""
     p = PATHS if paths is None else paths
 
     def _s(value: Any) -> str:
@@ -319,7 +298,6 @@ def describe_paths(paths: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
 
 
 def print_paths(stream=None) -> Dict[str, Any]:
-    """在日志里打出生效路径（便于确认用的是项目内模型 / vendor 代码）。"""
     info = describe_paths()
     out = stream or sys.stdout
     print("[路径] 配置文件：" + info["config_file"], file=out)
@@ -336,9 +314,6 @@ def print_paths(stream=None) -> Dict[str, Any]:
     return info
 
 
-# ---------------------------------------------------------------------------
-# 设备探测：用 SheetSage2 的 Python（带 torch / XPU）探测，主程序不 import torch
-# ---------------------------------------------------------------------------
 _PROBE_CODE = r"""
 import json
 info = {"xpu": False, "cuda": False, "name": "", "torch": "",
@@ -389,7 +364,7 @@ _DEVICE_CACHE: Optional[Dict[str, Any]] = None
 
 
 def probe_device(force: bool = False) -> Dict[str, Any]:
-    """返回 {'best': 'xpu'|'cuda'|'cpu', 'xpu':..., 'cuda':..., 'name':...}。"""
+    """返回 {'best': 'xpu'|'cuda'|'cpu', 'xpu':..., 'cuda':..., 'name':..., 'ai_ready':...}。"""
     global _DEVICE_CACHE
     if _DEVICE_CACHE is not None and not force:
         return dict(_DEVICE_CACHE)
@@ -434,7 +409,6 @@ def probe_device(force: bool = False) -> Dict[str, Any]:
 
 
 def resolve_device(requested: str = "auto") -> str:
-    """把 auto / xpu / cuda / cpu 解析成实际可用设备；不可用则回退。"""
     req = (requested or "auto").strip().lower()
     info = probe_device()
     available = {"cpu"}
@@ -451,12 +425,6 @@ def resolve_device(requested: str = "auto") -> str:
 
 
 def resolve_dtype(device: str, requested: str = "bf16") -> str:
-    """跨显卡 / CPU 精度自适应，防止 bf16 在旧 N 卡或 CPU 上崩。
-
-    * cuda 且不支持 bf16 → fp16
-    * cpu → fp32
-    * xpu / 支持 bf16 的 cuda → bf16
-    """
     req = (requested or "bf16").strip().lower()
     info = probe_device()
     dev = (device or "cpu").lower()
@@ -495,21 +463,16 @@ def device_label(active: Optional[str] = None) -> str:
     return "CPU"
 
 
-# ---------------------------------------------------------------------------
-# 子进程执行（实时回显 + 落日志 + 可取消）
-# ---------------------------------------------------------------------------
 _CURRENT_PROC: Optional[subprocess.Popen] = None
 _CANCEL = threading.Event()
 _PROC_LOCK = threading.Lock()
 
 
 def reset_cancel() -> None:
-    """每次开始新任务前清掉取消标记。"""
     _CANCEL.clear()
 
 
 def cancel_current() -> bool:
-    """取消当前正在跑的子进程；返回是否真的杀掉了进程。"""
     _CANCEL.set()
     with _PROC_LOCK:
         proc = _CURRENT_PROC
@@ -540,7 +503,6 @@ CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
 def no_window_kwargs(hide: bool = True) -> Dict[str, Any]:
-    """subprocess 启动参数：不弹控制台窗口（Windows 下生效）。"""
     if os.name != "nt":
         return {}
     startupinfo = subprocess.STARTUPINFO()
@@ -556,7 +518,6 @@ def run_command(
     timeout: float = STEP_TIMEOUT,
     cwd: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
-    """执行外部命令，实时回显并落日志，失败时抛出带日志尾部的异常。"""
     global _CURRENT_PROC
 
     log_path = Path(log_path)
@@ -585,15 +546,14 @@ def run_command(
     chunks: List[str] = []
 
     def pump() -> None:
-        """边读边回显：GUI 靠这些行解析进度。"""
         try:
             for line in proc.stdout:  # type: ignore[union-attr]
                 chunks.append(line)
                 try:
                     print(line.rstrip("\r\n"), flush=True)
-                except Exception:  # noqa: BLE001  没有可用 stdout 时只落日志
+                except Exception:  # noqa: BLE001
                     pass
-        except Exception:  # noqa: BLE001  输出流断开不影响退出码判断
+        except Exception:  # noqa: BLE001
             pass
 
     reader = threading.Thread(target=pump, daemon=True)
@@ -663,9 +623,6 @@ def run_command(
     }
 
 
-# ---------------------------------------------------------------------------
-# 通用输入定位
-# ---------------------------------------------------------------------------
 def _first_existing(directory: Path, names: Iterable[str]) -> Optional[Path]:
     for name in names:
         candidate = directory / name
@@ -679,7 +636,6 @@ def _read_tracks(path: Union[str, Path]) -> List[TrackNotes]:
 
 
 def _chord_notes_from(path: Union[str, Path], *, fallback_all: bool) -> List[Note]:
-    """从 MIDI / JSON 里取所有“和弦轨”的音符（轨名含 chord）。"""
     path = Path(path)
     if path.suffix.lower() == ".json":
         return chord_slices_to_notes(load_chords_json(path))
@@ -689,7 +645,6 @@ def _chord_notes_from(path: Union[str, Path], *, fallback_all: bool) -> List[Not
 
 
 def _dedupe_notes(notes: Iterable[Note]) -> List[Note]:
-    """同一批和弦常同时出现在 transcription.mid 与 chords.mid，按音高+秒级起止去重。"""
     seen = set()
     out: List[Note] = []
     for note in notes:
@@ -703,12 +658,10 @@ def _dedupe_notes(notes: Iterable[Note]) -> List[Note]:
 
 
 def _validate_env() -> None:
-    """步骤 1 之前的硬性检查，错误信息写成用户能看懂的话。"""
     if not SHEETSAGE2_PY.is_file():
         raise FileNotFoundError(
             f"找不到 SheetSage2 的 Python：{SHEETSAGE2_PY}\n"
-            f"请把可用的 XPU 虚拟环境放到该位置（或在本项目 config.json 里改 "
-            f"sheetsage2.python）。")
+            f"请点击右上角「环境与显卡体检 → 一键安装 / 修复环境」完成配置。")
     if not SHEETSAGE2_CLI.is_file():
         raise FileNotFoundError(
             f"找不到 SheetSage2 转录脚本：{SHEETSAGE2_CLI}\n"
@@ -718,7 +671,7 @@ def _validate_env() -> None:
         if not path.is_file():
             raise FileNotFoundError(
                 f"缺少 {name} 模型权重：{path}\n"
-                f"请把 model.safetensors 放回该目录（约 2.4GB / 0.2GB）。")
+                f"请点击右上角「环境与显卡体检 → 一键安装 / 修复环境」自动下载模型权重。")
 
 
 # ---------------------------------------------------------------------------
@@ -758,10 +711,9 @@ def step1(
     print(f"    CLI：{SHEETSAGE2_CLI}")
     if dev == "cpu":
         print("    CPU 推理：一首歌约 2~4 分钟（模型固定按 5 分钟窗计算），"
-              "进度长时间停在 0% 是正常的，请勿关闭窗口")
+              "请耐心等待，勿关闭窗口")
     run = run_command(cmd, out / "logs" / "step1_sheetsage2.log", timeout=timeout)
 
-    # 把三个分轨复制到输出根目录，便于单独导入 / 导出
     copied: Dict[str, str] = {}
     for name in ("melody_vocal.mid", "melody_instrumental.mid", "chords.mid",
                  "transcription.mid"):
@@ -777,7 +729,6 @@ def step1(
             f"SheetSage2 没有产出人声旋律（melody_vocal.mid / transcription.mid）：{raw}\n"
             f"请查看日志：{out / 'logs' / 'step1_sheetsage2.log'}")
 
-    # 统计（只读，用于界面显示）
     vocal_notes: List[Note] = []
     if (raw / "melody_vocal.mid").is_file():
         vocal_notes = select_track(read_midi_tracks(raw / "melody_vocal.mid"),
@@ -826,7 +777,6 @@ def _notes_to_slices(notes: Iterable[Note]) -> List[ChordSlice]:
 # 步骤 2：物理秒对齐 + 主旋律合并 + 和弦合并
 # ---------------------------------------------------------------------------
 def _better_note(candidate: Note, current: Note, mode: str) -> bool:
-    """重叠时谁胜出：duration（默认）或 velocity。"""
     if mode == "velocity":
         if candidate.velocity != current.velocity:
             return candidate.velocity > current.velocity
@@ -844,7 +794,7 @@ def merge_melodies(
     *,
     merge_mode: str = "duration",
 ) -> List[Note]:
-    """把 Vocal 与 Ins 合成严格单音；重叠时按时长 / 力度二选一。"""
+    """把 Vocal 与 Ins 合成严格单音；重叠时按时长优先合并。"""
     incoming: List[Note] = [n.copy() for n in list(vocal_notes) + list(instrumental_notes)]
     incoming = [n for n in incoming if n.end_sec > n.start_sec + 1e-9]
     incoming.sort(key=lambda n: (n.start_sec, -n.duration, -n.velocity, n.pitch))
@@ -903,13 +853,7 @@ def step2(
     integrated: Optional[Union[str, Path]] = None,
     merge_mode: str = "duration",
 ) -> Dict[str, Any]:
-    """物理秒对齐 + 主旋律单音合并 + 和弦合并。
-
-    输入二选一（也可以同时给）：
-      * 三个分轨：vocal / instrumental / chords；
-      * 一个综合 MIDI：integrated（如 transcription.mid）。
-    未显式给出的输入，会自动在 out_dir 里找同名文件。
-    """
+    """物理秒对齐 + 主旋律单音合并 + 和弦合并。"""
     t0 = time.time()
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -945,7 +889,6 @@ def step2(
             ins_notes = select_track(integrated_tracks, ["Ins", "Instrumental"],
                                      fallback_all=False).notes
 
-    # 和弦：分开的 chords 文件 + 综合 MIDI 里所有轨名含 chord 的轨，全部合并后去重
     chord_notes: List[Note] = []
     if chords_path and chords_path.is_file():
         chord_notes.extend(_chord_notes_from(chords_path, fallback_all=True))
@@ -955,7 +898,26 @@ def step2(
     chord_notes = _dedupe_notes(chord_notes)
     slices = _notes_to_slices(chord_notes)
 
-    # 主旋律单音化
+    # 未显式指定外部 chords 文件时，优先直读同次转录生成的原生 chord.lab（完整保留四音色彩与转位低音）
+    lab_source = ""
+    custom_external = bool(vocal or instrumental or integrated)
+    if not chords:
+        for cand in (out / "sheetsage2" / "chord.lab", out / "chord.lab"):
+            if cand.is_file():
+                beat_cand = _first_existing(cand.parent, ("beat.lab",))
+                lab_slices = parse_chord_lab_to_slices(cand, beat_cand)
+                if lab_slices:
+                    # 若用户手动指定了外部单轨文件，检查时长跨度是否属于同一首曲目（防跨歌串台）
+                    if custom_external and slices:
+                        midi_end = max((s.end_sec for s in slices), default=0.0)
+                        lab_end = max((s.end_sec for s in lab_slices), default=0.0)
+                        if midi_end > 0 and abs(lab_end - midi_end) > 15.0:
+                            break
+                    slices = lab_slices
+                    chord_notes = chord_slices_to_notes(slices)
+                    lab_source = str(cand)
+                break
+
     merged = merge_melodies(vocal_notes, ins_notes, merge_mode=merge_mode)
     melody_track = TrackNotes("Main Melody", merged)
     chord_track = chord_slices_to_track(slices, "Chords")
@@ -968,6 +930,8 @@ def step2(
     write_midi(out / "main_melody.mid", [melody_track], bpm=tempo)
     save_chords_json(out / "chords.json", slices)
     write_midi(out / "chords_merged.mid", [chord_track], bpm=tempo)
+    if lab_source:
+        write_midi(out / "chords.mid", [chord_track], bpm=tempo)
 
     span = [round(min((n.start_sec for n in merged), default=0.0), 6),
             round(max((n.end_sec for n in merged), default=0.0), 6)]
@@ -997,11 +961,13 @@ def step2(
             "chord_slices": len(slices),
             "chord_pitches": count_chord_slice_pitches(slices),
         },
+        "chord_source": lab_source or "midi",
         "span_sec": span,
     }
     print(f"[步骤2/3] 完成 {result['elapsed_sec']:.1f}s：Vocal {len(vocal_notes)} 音 + "
           f"Ins {len(ins_notes)} 音 -> 单音主旋律 {len(merged)} 音；"
-          f"和弦 {len(chord_notes)} 音 -> {len(slices)} 片 / {chord_track.name}")
+          f"和弦 {len(chord_notes)} 音 -> {len(slices)} 片 / {chord_track.name}"
+          + (f"（直读 {Path(lab_source).name}，含四音色彩与转位低音）" if lab_source else ""))
     return result
 
 
@@ -1017,18 +983,7 @@ def fix_pitch_range(
     isolated_duration: float = 0.35,
     isolated_semitones: int = 10,
 ) -> Tuple[List[Note], Dict[str, int]]:
-    """按固定音域修正，返回 (修正后音符, 修正统计)。
-
-    严格按 3 步顺序：
-      1) 超界孤立倍频噪点：pitch > high、比前后紧邻都高 >=10、时值 <0.35s → -12；
-      2) 保全音程的整轨平移：
-         2A 物理超界无损平移（±12，绝对优先于单音折断）；
-         2B 木吉他模式专属：>76 高音衰减区占比 >25% 时再整体 -12；
-      3) 单音边界兜底（while >high -> -12 / while <low -> +12），
-         记入 `boundary_folded`。
-
-    `instrument_mode`：`"acoustic"`（默认，木吉他会做 2B）/ `"electric"`（跳过 2B）。
-    """
+    """按固定音域修正，返回 (修正后音符, 修正统计)。"""
     if low < 0 or high > 127 or low >= high:
         raise ValueError(f"音域参数非法：{low}-{high}")
     if instrument_mode not in ("acoustic", "electric"):
@@ -1043,7 +998,6 @@ def fix_pitch_range(
     if not fixed:
         return fixed, stats
 
-    # ---- 第 1 步：先除噪（防止单颗噪点拉偏整轨判断）----
     current = [n.pitch for n in fixed]
     for i in range(1, len(fixed) - 1):
         p = current[i]
@@ -1060,7 +1014,6 @@ def fix_pitch_range(
         over = sum(1 for p in ps if p > high)
         return ps, med, over / float(len(ps))
 
-    # ---- 第 2A 步：整轨八度平移（最多 3 次）----
     while stats["global_down_octaves"] + stats["global_up_octaves"] < 3:
         ps, med, over_ratio = _stats_now()
         top, bottom = ps[-1], ps[0]
@@ -1078,7 +1031,6 @@ def fix_pitch_range(
             continue
         break
 
-    # ---- 第 2B 步：木吉他高音衰减区（只在 2A 没动过整轨时做一次）----
     if instrument_mode == "acoustic" and stats["global_down_octaves"] == 0:
         ps, _med, _ratio = _stats_now()
         high_ratio = sum(1 for p in ps if p > 76) / float(len(ps))
@@ -1088,7 +1040,6 @@ def fix_pitch_range(
             stats["global_down_octaves"] += 1
             stats["acoustic_extra_shift"] = 1
 
-    # ---- 第 3 步：单音边界兜底 ----
     for n in fixed:
         while n.pitch > high:
             n.pitch -= 12
@@ -1108,7 +1059,6 @@ def fix_pitch_range(
 
 def correct_pitch_range(notes: Sequence[Note], *, low: int = 40, high: int = 88,
                         instrument_mode: str = "acoustic") -> List[Note]:
-    """便于 GUI / 测试调用的简化版：只返回修正后的音符。"""
     return fix_pitch_range(notes, low=low, high=high,
                            instrument_mode=instrument_mode)[0]
 
@@ -1124,11 +1074,7 @@ def step3(
     final_name: Optional[str] = None,
     source_audio: Optional[Union[str, Path]] = None,
 ) -> Dict[str, Any]:
-    """超音域修正 + 导出最终 MIDI（Main Melody + Chords 两轨）。
-
-    `instrument_mode`：`"acoustic"`（默认，木吉他高音衰减区整体下移）/
-                       `"electric"`（电吉他，保留高把位）。
-    """
+    """超音域修正 + 导出最终 MIDI（Main Melody + Chords 两轨）。"""
     t0 = time.time()
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -1160,7 +1106,6 @@ def step3(
             slices = _notes_to_slices(chord_notes)
     chord_track = chord_slices_to_track(slices, "Chords")
 
-    # 最终文件名：显式指定 > 音频同名 > 通用名
     if final_name:
         name = str(final_name).strip()
         if not name.lower().endswith((".mid", ".midi")):
@@ -1369,7 +1314,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ != "__main__":
-    # 以包方式导入时，让顶层的 `import pipeline` 也拿到同一个对象
     sys.modules.setdefault("pipeline", sys.modules[__name__])
 
 if __name__ == "__main__":
