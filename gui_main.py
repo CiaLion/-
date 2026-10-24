@@ -538,7 +538,7 @@ class UnifiedWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("《异键演奏》")
+        self.setWindowTitle("异键演奏")
         self.resize(1180, 900)
         root = QWidget()
         self.setCentralWidget(root)
@@ -547,7 +547,7 @@ class UnifiedWindow(QMainWindow):
         lay.setSpacing(6)
 
         top = QHBoxLayout()
-        title = QLabel("《异键演奏》")
+        title = QLabel("异键演奏")
         title.setObjectName("appTitle")
         top.addWidget(title)
         self.lbl_ai = QLabel("AI 加速：检测中…")
