@@ -268,11 +268,12 @@ def find_game_window():
                 size = wintypes.DWORD(1024)
                 kernel32.QueryFullProcessImageNameW(hProc, 0, path_buf, ctypes.byref(size))
                 kernel32.CloseHandle(hProc)
-                proc_path = path_buf.value
-                if "HTGame" in proc_path or "NTE" in proc_path or "异环" in title:
+                proc_path = path_buf.value 
+                if any(kw in proc_path for kw in ("HTGame", "NTE", "Neverness")) or \
+                   any(kw in title for kw in ("异环", "NTE", "Neverness")):
                     found_hwnd = hwnd
                     return 0
-            elif "异环" in title:
+            elif any(kw in title for kw in ("异环", "NTE", "Neverness")):
                 found_hwnd = hwnd
                 return 0
         return 1

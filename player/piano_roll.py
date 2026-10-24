@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""piano_roll.py -- 《异键演奏》绑定游戏物理规则的钢琴卷帘编辑器。
+"""piano_roll.py -- 《异键演奏》v1.1 绑定游戏物理规则的钢琴卷帘编辑器。
 
 ★ 单一物理真相源：
   指法角标（弦/品/页）、同帧异品丢音、换品/翻页晚出，全部来自
   `midi_compiler.compile_fret / compile_chord / preschedule` 的真实输出，
-  本文件**不写任何平行的指法分配或延迟公式**。
+  本文件不写任何平行的指法分配或延迟公式。
 
 两种模式：
   · 模式 A（通用 MIDI）：打开 A 端任意中间/成品 MIDI，改音高/时值；
@@ -13,13 +13,12 @@
     松开鼠标即跑 `compile_fret/compile_chord + preschedule`，把真实结果画回音符；
     「应用微调」走 `midi_compiler.compile_custom_role` 直通重编。
 
-试听：numpy 合成拨弦包络 → 内存 WAV → winsound.SND_MEMORY|SND_ASYNC，
+试听：numpy 合成拨弦包络 → 内存 WAV → QMediaPlayer / winsound，
       不 import soundcard，零 COM 冲突。
 """
 from __future__ import annotations
 
 import bisect
-import copy
 import io
 import json
 import math
@@ -35,21 +34,24 @@ for _p in (_ROOT, _HERE, os.path.join(_ROOT, "transcriber")):
     if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
-# 中文项目路径下 Qt 找不到平台插件：必须在 import PyQt5 之前设好
-_QT_PLUGINS = Path(sys.prefix) / "Lib" / "site-packages" / "PyQt5" / "Qt5" / "plugins"
-if _QT_PLUGINS.is_dir():
-    os.environ.setdefault("QT_PLUGIN_PATH", str(_QT_PLUGINS))
-    os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(_QT_PLUGINS / "platforms"))
+# 中文项目路径与便携 runtime 下 Qt 平台插件定位：优先项目内 .venv，次选 sys.prefix
+for _cand_plug in (
+    Path(_ROOT) / ".venv" / "Lib" / "site-packages" / "PyQt5" / "Qt5" / "plugins",
+    Path(sys.prefix) / "Lib" / "site-packages" / "PyQt5" / "Qt5" / "plugins",
+):
+    if _cand_plug.is_dir():
+        os.environ.setdefault("QT_PLUGIN_PATH", str(_cand_plug))
+        os.environ.setdefault("QT_QPA_PLATFORM_PLUGIN_PATH", str(_cand_plug / "platforms"))
+        break
 
 from PyQt5.QtCore import (QEvent, QPoint, QRect, Qt, QTimer, QUrl,  # noqa: E402
                           pyqtSignal)
-from PyQt5.QtGui import (QBrush, QColor, QFont, QKeySequence, QPainter,  # noqa: E402
+from PyQt5.QtGui import (QColor, QFont, QKeySequence, QPainter,  # noqa: E402
                          QPen, QPolygon)
-from PyQt5.QtWidgets import (QAbstractScrollArea, QApplication, QComboBox,  # noqa: E402
-                             QDialog, QFileDialog, QHBoxLayout, QLabel,
-                             QMessageBox, QPushButton, QScrollArea, QSizePolicy,
-                             QSlider, QSpinBox, QShortcut, QCheckBox,
-                             QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QAbstractScrollArea, QApplication, QCheckBox,  # noqa: E402
+                             QComboBox, QDialog, QFileDialog, QHBoxLayout,
+                             QLabel, QMessageBox, QPushButton, QShortcut,
+                             QSizePolicy, QSlider, QVBoxLayout)
 
 import midi_compiler as MC  # noqa: E402
 import guitar_plan as GP  # noqa: E402
@@ -66,12 +68,11 @@ MIN_DUR = MC.KEY_HOLD if hasattr(MC, "KEY_HOLD") else 0.025
 ALL_CHORDS = list(getattr(GP, "ALL_CHORDS", []) or [])
 
 PLAY_ROLE_LABELS = {
-    "solo": "单人独奏 (Solo)",
+    "solo": "1P 单人独奏（Solo 指弹）",
     "duet_lead": "双人合奏 · 1P 主音",
-    "duet_rhythm": "双人合奏 · 2P 和弦",
-    "duet_rhythm_fret": "双人合奏 · 2P 品格",
+    "duet_rhythm_fret": "双人合奏 · 2P 伴奏（琶音/根音）",
+    "duet_rhythm": "双人合奏 · 2P 伴奏（柱式/扫弦）",
 }
-
 
 
 def _out_dir():
@@ -115,6 +116,8 @@ class PianoRollModel(object):
         self.notes = []
         self.markers = []
         self.slices = []
+        # v1.1：2P 混切分段（[(秒, "chord"|"fret")]），卷帘按它分段校验/上色
+        self.mode_markers = []
         self.bpm = 120.0
         self.beat_sec = 0.5
         self.timing = MC.Timing()
@@ -122,6 +125,8 @@ class PianoRollModel(object):
         self.analysis = {"kind": None, "notes": [], "dropped": 0, "late": 0}
         self.phys_enabled = False
         self.role_notes = {}
+        self._role_undo = {}
+        self._role_redo = {}
         self.last_saved = None
         self.force_recalc = False
         self._a_key = {}
@@ -142,40 +147,69 @@ class PianoRollModel(object):
         if role:
             self._load_role(force_recalc=force_recalc)
             self.role_notes[self.role] = [dict(n) for n in self.notes]
+            self._role_undo[self.role] = []
+            self._role_redo[self.role] = []
         else:
             self._load_midi()
 
-    def _load_role(self, force_recalc=False):
-        song = MC.load_song(self.path, force_recalc=force_recalc)
-        self.song = song
-        self.kind = MC.role_kind(song, self.role)
-        track, _how = MC.pick_track(song, self.role)
-        self.track = track
-        raw = song.get("notes_by_track", {}).get(track, []) if track is not None else []
-        self.notes = [dict(n) for n in raw]
-        self.markers = [tuple(x) for x in (song.get("markers") or [])]
+    def _sync_role_mode_state(self):
+        """按当前激活角色同步 `mode_markers`、`markers` 与每个切片的 `hybrid_mode`。
+
+        关键修复：从 1P 角色切回已缓存的 2P 角色时，必须恢复 2P 的 `mode_markers`
+        并刷新 `slices` 的 `hybrid_mode`，否则混切状态会丢失变为 0 次。
+        """
+        song = self.song or {}
         p2 = song.get("p2") or {}
+        if self.role in (MC.ROLE_DUET_RHYTHM, MC.ROLE_DUET_RHYTHM_FRET):
+            raw_mm = song.get("mode_markers") or p2.get("mode_markers") or []
+            self.mode_markers = [(round(float(mt), 6), str(md)) for (mt, md) in raw_mm]
+            chord_mks = (p2.get("markers") or {}).get("chord") or song.get("markers") or []
+            self.markers = [tuple(x) for x in chord_mks]
+        else:
+            self.mode_markers = []
+            self.markers = [tuple(x) for x in (song.get("markers") or [])]
+        for s in self.slices:
+            s["hybrid_mode"] = self._mode_at_markers(float(s.get("t") or 0.0))
+
+    def _normalize_role_note_flags(self):
         for n in self.notes:
             n["t"] = round(_as_float(n.get("t")), 6)
             n["dur"] = round(max(MIN_DUR, _as_float(n.get("dur"), 0.25)), 6)
             n["pitch"] = int(n.get("pitch") or 60)
             n["vel"] = int(n.get("vel") or 80)
-            # Solo 轨里：`src=="melody"` 是主旋律；fret_arp/fret_root 是自动伴奏
             if self.role == MC.ROLE_SOLO:
                 n["is_melody"] = (n.get("src") == "melody") or not n.get("src")
-            elif self.role == MC.ROLE_DUET_RHYTHM:
+            elif self.role in (MC.ROLE_DUET_RHYTHM, MC.ROLE_DUET_RHYTHM_FRET):
                 n["is_melody"] = False
             else:
                 n["is_melody"] = True
+
+    def _load_role(self, force_recalc=False):
+        if self.song is None or force_recalc or self.song.get("path") != self.path:
+            self.song = MC.load_song(self.path, force_recalc=force_recalc)
+        song = self.song
+        self.kind = MC.role_kind(song, self.role)
+        track, _how = MC.pick_track(song, self.role)
+        self.track = track
+        raw = song.get("notes_by_track", {}).get(track, []) if track is not None else []
+        self.notes = [dict(n) for n in raw]
+        self._normalize_role_note_flags()
+        p2 = song.get("p2") or {}
         self.slices = []
         for s in (p2.get("slices") or []):
             try:
-                self.slices.append({"t": round(float(s.get("t") or 0), 6),
-                                    "end": round(float(s.get("end") or 0), 6),
-                                    "name": s.get("name") or "",
-                                    "beat_sec": float(s.get("beat_sec") or 0) or 0.5})
+                t0 = round(float(s.get("t") or 0), 6)
+                self.slices.append({
+                    "t": t0,
+                    "end": round(float(s.get("end") or 0), 6),
+                    "name": s.get("name") or "",
+                    "raw_label": (s.get("raw_label") or s.get("label") or s.get("name") or ""),
+                    "hybrid_mode": "chord",
+                    "beat_sec": float(s.get("beat_sec") or 0) or 0.5,
+                })
             except Exception:
                 continue
+        self._sync_role_mode_state()
         self.bpm = _as_float((song.get("bpm") or 120.0), 120.0) or 120.0
         self.beat_sec = (self.slices[0]["beat_sec"] if self.slices else
                          (60.0 / self.bpm if self.bpm else 0.5))
@@ -196,7 +230,7 @@ class PianoRollModel(object):
             self.bpm = 120.0
         self.beat_sec = 60.0 / self.bpm if self.bpm else 0.5
         self.kind = None
-        self.markers, self.slices = [], []
+        self.markers, self.slices, self.mode_markers = [], [], []
         self.tl, self.analysis = None, {"kind": None, "notes": [], "dropped": 0, "late": 0}
 
     def _select_track_data(self, idx):
@@ -224,12 +258,14 @@ class PianoRollModel(object):
 
     # ── 角色切换 / 开关重建（模式 B）──────────────────────────────────
     def remember_role_notes(self):
-        """把当前画布上的音符记到该角色名下（切角色/关窗口前都要先存）。"""
+        """把当前画布上的音符与撤销栈记到该角色名下。"""
         if self.mode == "role" and self.role:
             self.role_notes[self.role] = [dict(n) for n in self.notes]
+            self._role_undo[self.role] = list(self._undo)
+            self._role_redo[self.role] = list(self._redo)
 
     def switch_role(self, new_role):
-        """在卷帘内切换演奏角色；已编辑过的角色沿用内存里的版本。"""
+        """在卷帘内切换演奏角色；完整恢复目标角色的音符、混切标记与撤销栈。"""
         if self.mode != "role" or not new_role or new_role == self.role:
             return False
         self.remember_role_notes()
@@ -237,37 +273,66 @@ class PianoRollModel(object):
             self.role = new_role
             self.kind = MC.role_kind(self.song or {}, new_role)
             self.notes = [dict(n) for n in self.role_notes[new_role]]
+            self._normalize_role_note_flags()
+            self._undo = list(self._role_undo.get(new_role) or [])
+            self._redo = list(self._role_redo.get(new_role) or [])
+            self._sync_role_mode_state()
             self.timing = MC.Timing()
             self.compile()
         else:
-            self.load(self.path, role=new_role)
+            self.role = new_role
+            self._load_role(force_recalc=False)
+            self.role_notes[self.role] = [dict(n) for n in self.notes]
+            self._undo = []
+            self._redo = []
         return True
 
     def roll_flags(self):
         """当前播放器用的琶音 / 扫弦律动开关。"""
         try:
-            import player_config as PC
             cfg = PC.load()
             return (bool(cfg.get("enable_arpeggio", True)),
                     bool(cfg.get("enable_chord_rhythm", True)))
         except Exception:
             return True, True
 
-    def rebuild_for_flags(self, enable_arpeggio, enable_chord_rhythm):
-        """琶音 / 扫弦律动变化后，基于原曲重新生成 2P 与 Solo。
+    def roll_strum_mode(self):
+        """当前 2P 和弦段的发声方式：True=鼠标扫弦，False=多弦同按柱式抓弦。"""
+        try:
+            return bool(PC.load().get("chord_strum_mode", False))
+        except Exception:
+            return False
 
-        主旋律（1P 主音）的手动微调会被保留；2P 与 Solo 属于派生结果，按新开关重算。
-        """
+    def rebuild_for_strum_mode(self, on):
+        """柱式 / 扫弦切换：写回配置并按新方式重算 2P 混切序列。"""
         self.remember_role_notes()
         melody = self.role_notes.get(MC.ROLE_DUET_LEAD)
         try:
-            import player_config as PC
+            PC.save({"chord_strum_mode": bool(on)})
+        except Exception:
+            pass
+        role = self.role
+        self.role_notes = {}
+        self.song = None
+        self.load(self.path, role=role, force_recalc=True)
+        if melody:
+            self.role_notes[MC.ROLE_DUET_LEAD] = [dict(n) for n in melody]
+            if role == MC.ROLE_DUET_LEAD:
+                self.notes = [dict(n) for n in melody]
+                self.compile()
+
+    def rebuild_for_flags(self, enable_arpeggio, enable_chord_rhythm):
+        """琶音 / 扫弦律动变化后，基于原曲重新生成 2P 与 Solo。"""
+        self.remember_role_notes()
+        melody = self.role_notes.get(MC.ROLE_DUET_LEAD)
+        try:
             PC.save({"enable_arpeggio": bool(enable_arpeggio),
                      "enable_chord_rhythm": bool(enable_chord_rhythm)})
         except Exception:
             pass
         role = self.role
         self.role_notes = {}
+        self.song = None
         self.load(self.path, role=role, force_recalc=True)
         if melody:
             self.role_notes[MC.ROLE_DUET_LEAD] = [dict(n) for n in melody]
@@ -297,9 +362,10 @@ class PianoRollModel(object):
     def add_note(self, t, pitch, dur=None, vel=85):
         self._snapshot()
         dur = max(MIN_DUR, _as_float(dur, 0.25))
+        is_mel = self.role not in (MC.ROLE_DUET_RHYTHM, MC.ROLE_DUET_RHYTHM_FRET)
         n = {"t": round(max(0.0, _as_float(t)), 6), "dur": round(dur, 6),
              "pitch": _clamp_pitch(pitch), "vel": max(1, min(127, int(vel))),
-             "is_melody": True}
+             "is_melody": is_mel}
         self.notes.append(n)
         return n
 
@@ -348,7 +414,6 @@ class PianoRollModel(object):
 
     # ── 编译（唯一真相源）──────────────────────────────────────────────
     def compile(self):
-        # 每次编译都重新读盘，保证高级时间参数改动实时生效
         self.timing = MC.Timing()
         if self.tracks and 0 <= int(getattr(self, "track_idx", 0) or 0) < len(self.tracks):
             self.tracks[int(self.track_idx)].notes = self.to_convert_notes()
@@ -356,10 +421,14 @@ class PianoRollModel(object):
             self.tl = None
             return None
         try:
-            tl = MC.compile_custom_role(self.song, self.role, self.notes,
-                                        timing=self.timing,
-                                        chord_slices=self.markers,
-                                        start_offset=0.0)
+            tl = MC.compile_custom_role(
+                self.song, self.role, self.notes,
+                timing=self.timing,
+                chord_slices=self.markers,
+                start_offset=0.0,
+                mode_markers=self.mode_markers,
+                chord_strum_mode=bool((self.song or {}).get("chord_strum_mode")),
+            )
         except Exception as exc:  # noqa: BLE001
             self.tl = {"events": [], "stats": {}, "hw_stats": {},
                        "analysis": {"kind": self.kind, "notes": [], "dropped": 0,
@@ -402,11 +471,18 @@ class PianoRollModel(object):
                 return lst[j]
         return None
 
-    def invalid_notes(self):
-        """返回红色非法音符 [(note, reason), ...]。
+    def save_guard(self):
+        """保存/应用前的硬拦截判定（不弹窗，供门禁与对话框共用）。"""
+        if self.mode == "role":
+            try:
+                self.compile()
+            except Exception:
+                pass
+        bad = self.invalid_notes()
+        return (not bad), bad
 
-        reason: range（<40/>88）、dropped（同帧异品被丢）、mine（2P 和弦地雷弦）。
-        """
+    def invalid_notes(self):
+        """返回红色非法音符 [(note, reason), ...]。"""
         bad = []
         for n in self.notes:
             try:
@@ -419,7 +495,9 @@ class PianoRollModel(object):
                 reason = "range"
             elif a is not None and a.get("dropped"):
                 reason = "dropped"
-            elif self.kind == "chord" and a is not None and a.get("string"):
+            elif a is not None and a.get("mode") == "fret":
+                reason = None
+            elif self.mode_at(n["t"]) == "chord" and a is not None and a.get("string"):
                 name = a.get("chord") or ""
                 if name and int(a["string"]) in self.mine_strings(name):
                     reason = "mine"
@@ -437,9 +515,12 @@ class PianoRollModel(object):
         dropped = int(st.get("dropped") or self.analysis.get("dropped") or 0)
         late = int(st.get("late") or self.analysis.get("late") or 0)
         max_late = float(st.get("max_late") or 0.0) * 1000.0
+        z = int(st.get("switches") or 0)
+        dbl = int(st.get("doubled") or 0)
         return ("总发声：%d ｜ 翻页步数：%d ｜ 丢弃音：%d ｜ 晚出音：%d（最大 %.0f ms）"
+                " ｜ Z键混切: %d 次 ｜ 双音/柱式: %d 处"
                 % (int(st.get("voices") or 0), int(st.get("turns") or 0),
-                   dropped, late, max_late))
+                   dropped, late, max_late, z, dbl))
 
     # ── 和弦模式：24 和弦 / 地雷弦 / 扫弦 / 单拨 ────────────────────────
     def chord_names(self):
@@ -447,6 +528,31 @@ class PianoRollModel(object):
 
     def valid_chord(self, name):
         return name in ALL_CHORDS
+
+    def _mode_at_markers(self, t):
+        if not self.mode_markers:
+            return self.kind or "chord"
+        got = "chord"
+        for (mt, mode) in self.mode_markers:
+            if float(mt) <= float(t) + 1e-6:
+                got = str(mode or got)
+            else:
+                break
+        return got
+
+    def mode_at(self, t):
+        """t 时刻 2P 处于哪种模式：`"chord"` 或 `"fret"`。"""
+        return self._mode_at_markers(t)
+
+    def hybrid_switch_times(self):
+        """所有发生 Z 键切换的时刻（相邻两段模式不同处），供卷帘画 ⚡Z 标记。"""
+        out = []
+        prev = None
+        for (mt, mode) in self.mode_markers or []:
+            if prev is not None and str(mode) != str(prev):
+                out.append(round(float(mt), 6))
+            prev = mode
+        return out
 
     def chord_at(self, t):
         got = None
@@ -471,6 +577,7 @@ class PianoRollModel(object):
         self._snapshot()
         s = self.slices[index]
         s["name"] = name
+        s["raw_label"] = name
         self._rewrite_slice_notes(s)
         for i, (mt, nm) in enumerate(self.markers):
             if abs(mt - s["t"]) <= 1e-6:
@@ -478,21 +585,20 @@ class PianoRollModel(object):
         return True
 
     def _rewrite_slice_notes(self, s):
-        """把切片内的音符换成新和弦的"扫弦音簇"（数据生成，不涉及指法分配）。"""
+        """把切片内的音符换成新和弦的音簇。"""
         t, end = s["t"], s["end"]
         keep = [n for n in self.notes if not (t - 1e-6 <= n["t"] < end - 1e-6)]
-        pitches = [p for _s, p in MC.chord_sounding_strings(s["name"])]
-        if len(pitches) < 3:
-            pitches = [p for p in range(40, 76) if p % 12 in GP.chord_pitch_class_set(s["name"])]
-        pitches = pitches[:6]
+        pitches = [p for _s, p in MC.chord_pluck_strings(s["name"])][:4]
+        if len(pitches) < 2:
+            pitches = [p for _s, p in MC.chord_sounding_strings(s["name"])][:4]
         for p in pitches:
-            keep.append({"t": round(t, 6), "dur": round(max(0.15, min(0.35, end - t)), 6),
-                         "pitch": int(p), "vel": 90, "is_melody": False})
+            keep.append({"t": round(t, 6), "dur": round(max(0.20, min(0.35, end - t)), 6),
+                         "pitch": int(p), "vel": 85, "is_melody": False})
         self.notes = keep
         self._sort()
 
     def mine_strings(self, name):
-        """被"小二度错音"锁死的弦号（真实数据：guitar_plan.pluck_safe_strings）。"""
+        """被"小二度错音"锁死的弦号（guitar_plan.pluck_safe_strings）。"""
         safe = set(int(s) for s in GP.pluck_safe_strings(name))
         return [s for s in range(1, 7) if s not in safe]
 
@@ -500,7 +606,7 @@ class PianoRollModel(object):
         return [s for s in range(1, 7) if s not in self.mine_strings(name)]
 
     def add_strum(self, t, up=True, name=None):
-        """添加一次扫弦：当前和弦 ≥3 音同帧音簇（真实 compile_chord 会判成扫弦）。"""
+        """添加一次扫弦/柱式：当前和弦 ≥3 音同帧音簇。"""
         t = round(max(0.0, float(t)), 6)
         name = name or self.chord_at(t)
         if not self.valid_chord(name or ""):
@@ -515,7 +621,7 @@ class PianoRollModel(object):
         self.begin_batch()
         out = []
         for p in pitches:
-            out.append(self.add_note(t, p, dur=0.35, vel=75))
+            out.append(self.add_note(t, p, dur=0.30, vel=75))
         self.end_batch()
         return out
 
@@ -556,6 +662,10 @@ class PianoRollModel(object):
         """恢复默认自动编配：重新走 load_song/adapt_song 的自动结果。"""
         if self.mode != "role":
             return False
+        self.role_notes = {}
+        self._role_undo = {}
+        self._role_redo = {}
+        self.song = None
         self.load(self.path, role=self.role, force_recalc=True)
         return True
 
@@ -575,7 +685,6 @@ class PianoRollModel(object):
         return [dict(n) for n in ((song.get("notes_by_track") or {}).get(idx) or [])]
 
     def _main_melody_notes(self):
-        # 主旋律只取 1P 主音轨；SOLO_MASTER 里含伴奏，不能当主旋律写回去
         return [dict(n) for n in (self.role_notes.get(MC.ROLE_DUET_LEAD)
                                   or self._song_notes(MC.TRACK_DUET_LEAD)
                                   or self._song_notes(MC.TRACK_SOLO_MASTER))]
@@ -600,16 +709,12 @@ class PianoRollModel(object):
         chords = self._chord_track_notes()
         if chords:
             out.append(CV.TrackNotes("Chords", self.to_convert_notes(chords)))
-        # 四条角色轨都写：缺失的用已适配 song 里的版本补上，
-        # 这样重新加载时能走“信任角色轨”路径，不清洗用户微调。
         p2_variants = ((self.song or {}).get("p2") or {}).get("notes") or {}
         for role, name in ((MC.ROLE_SOLO, MC.TRACK_SOLO_MASTER),
                            (MC.ROLE_DUET_RHYTHM, MC.TRACK_DUET_RHYTHM)):
             if any(tr.name == name for tr in out):
                 continue
             if role == MC.ROLE_DUET_RHYTHM:
-                # 2P 虚拟轨同一轨名承载和弦块与品格线；文件里只存和弦块，
-                # 品格线在加载时按当前开关重新生成。
                 notes = (self.role_notes.get(role) or p2_variants.get("chord")
                          or self._song_notes(name))
             else:
@@ -617,6 +722,11 @@ class PianoRollModel(object):
             if not notes:
                 continue
             out.append(CV.TrackNotes(name, self.to_convert_notes(notes)))
+        arp = (self.role_notes.get(MC.ROLE_DUET_RHYTHM_FRET)
+               or p2_variants.get("arp") or [])
+        if arp and not any(tr.name == MC.TRACK_DUET_P2_ARP for tr in out):
+            out.append(CV.TrackNotes(MC.TRACK_DUET_P2_ARP,
+                                     self.to_convert_notes(arp)))
         if not out:
             out = [CV.TrackNotes(self.track_name or "Main Melody",
                                  self.to_convert_notes())]
@@ -630,7 +740,13 @@ class PianoRollModel(object):
             tracks = self.multitrack_export()
         else:
             tracks = [CV.TrackNotes(self.track_name or "Main Melody", self.to_convert_notes())]
-        CV.write_midi(path, tracks, bpm=float(self.bpm or 120.0))
+        text_events = []
+        raw_mm = self.mode_markers or ((self.song or {}).get("mode_markers") or [])
+        if raw_mm:
+            text_events = [(float(mt), "P2_MODE:%s" % str(md))
+                           for (mt, md) in raw_mm]
+        CV.write_midi(path, tracks, bpm=float(self.bpm or 120.0),
+                      text_events=text_events)
         jp = None
         if sync_json:
             jp = self.sync_json(path)
@@ -675,7 +791,6 @@ class PianoRollModel(object):
         src = self.slices or [{"t": m[0], "end": None, "name": m[1]}
                               for m in self.markers]
         if not src:
-            # 通用 MIDI 模式（如 chords_merged.mid）：按 30ms 内起音聚簇
             notes = sorted(self.notes, key=lambda n: (n["t"], n["pitch"]))
             clusters = []
             for n in notes:
@@ -770,7 +885,7 @@ class PianoRollCanvas(QAbstractScrollArea):
         self.row_h = 13.0
         self.grid_div = 4                # 每拍切 4 份 = 1/4 拍
         self.selection = []
-        self.sel_slice = index = None
+        self.sel_slice = None
         self.cursor_t = 0.0
         self._drag = None
         self._slice_drag = None
@@ -840,7 +955,7 @@ class PianoRollCanvas(QAbstractScrollArea):
 
     def note_rect(self, n):
         x = self.x_of(n["t"])
-        w = max(3.0, n["dur"] * self.pps)
+        w = max(6.0, n["dur"] * self.pps)
         y = self.y_of(n["pitch"])
         return QRect(int(round(x)), int(round(y)), int(round(w)),
                      max(3, int(round(self.row_h)) - 1))
@@ -959,14 +1074,6 @@ class PianoRollCanvas(QAbstractScrollArea):
                     last_label_x = x
             idx += 1
             t += beat
-        if self.model.mode == "role":
-            p.setPen(QColor("#7ee787"))
-            p.setFont(QFont("Microsoft YaHei UI", 8))
-            p.drawText(QRect(KEY_W + 4, 0, w - KEY_W, RULER_H),
-                       Qt.AlignRight | Qt.AlignVCenter,
-                       "%s · %s" % ((self.model.tl or {}).get("role_cn") or "",
-                                    "品格" if self.model.kind == "fret" else "和弦"))
-        # 播放指针把手（可拖动）
         if self.playhead is not None:
             x = self.x_of(self.playhead)
             if KEY_W - 6 <= x <= w + 6:
@@ -978,7 +1085,6 @@ class PianoRollCanvas(QAbstractScrollArea):
                 p.drawPolygon(tri)
                 p.setPen(QPen(QColor("#ffd866"), 2))
                 p.drawLine(int(x), 0, int(x), RULER_H - 2)
-        # 拖动时的时刻浮动提示
         if self._seek_drag and self._seek_x is not None:
             txt = "%.2f s" % (max(0.0, self.t_of(self._seek_x)))
             tw = 64
@@ -993,20 +1099,65 @@ class PianoRollCanvas(QAbstractScrollArea):
     def _paint_slices(self, p, w):
         if not self.model.slices:
             return
-        p.setFont(QFont("Microsoft YaHei UI", 8))
+        bar_h = max(14, int(self.row_h) + 2)
+        p.setFont(QFont("Microsoft YaHei UI", 8, QFont.Bold))
+        # v1.1：将相邻且同模式、同和弦名的单拍切片合并为连续视觉块，
+        # 避免每拍 1 个切片在缩小时因单拍窄于 34px 而导致整屏和弦名全部消失！
+        runs = []
         for i, s in enumerate(self.model.slices):
-            x1 = self.x_of(s["t"])
-            x2 = self.x_of(s["end"])
+            hybrid = str(s.get("hybrid_mode") or "chord") == "fret"
+            disp = (s.get("raw_label") or s.get("name") or "") if hybrid \
+                else (s.get("name") or s.get("raw_label") or "")
+            sel = (self.sel_slice == i)
+            if (runs and runs[-1]["hybrid"] == hybrid
+                    and runs[-1]["disp"] == disp
+                    and abs(float(s["t"]) - runs[-1]["end"]) <= 0.12):
+                runs[-1]["end"] = float(s["end"])
+                runs[-1]["sel"] = runs[-1]["sel"] or sel
+            else:
+                runs.append({"t": float(s["t"]), "end": float(s["end"]),
+                             "hybrid": hybrid, "disp": disp, "sel": sel})
+
+        for r in runs:
+            x1 = self.x_of(r["t"])
+            x2 = self.x_of(r["end"])
             if x2 < KEY_W or x1 > w:
                 continue
-            col = QColor("#3b2a12") if self.sel_slice != i else QColor("#5a4218")
-            p.fillRect(int(max(KEY_W, x1)), RULER_H, int(max(1, min(w, x2) - max(KEY_W, x1))),
-                       int(self.row_h), col)
-            if x2 - x1 > 30:
-                p.setPen(QColor("#ffd866"))
-                p.drawText(QRect(int(x1) + 3, RULER_H, int(x2 - x1) - 4,
-                                 int(self.row_h)),
-                           Qt.AlignLeft | Qt.AlignVCenter, s.get("name") or "")
+            vx1 = int(max(KEY_W, x1))
+            vx2 = int(min(w, x2))
+            vw = max(1, vx2 - vx1)
+            if r["hybrid"]:
+                col = QColor("#155e4f") if r["sel"] else QColor("#0f3d33")
+                txt_col = QColor("#6ee7b7")
+                full_lbl = "[品格] %s" % r["disp"]
+                short_lbl = r["disp"]
+            else:
+                col = QColor("#5a4218") if r["sel"] else QColor("#3b2a12")
+                txt_col = QColor("#ffd866")
+                full_lbl = "[和弦] %s" % r["disp"]
+                short_lbl = r["disp"]
+            p.fillRect(vx1, RULER_H, vw, bar_h, col)
+            p.setPen(QPen(QColor("#1e293b"), 1))
+            p.drawLine(vx1, RULER_H, vx1, RULER_H + bar_h)
+            if vw >= 54:
+                p.setPen(txt_col)
+                p.drawText(QRect(vx1 + 4, RULER_H, vw - 6, bar_h),
+                           Qt.AlignLeft | Qt.AlignVCenter, full_lbl)
+            elif vw >= 16 and short_lbl:
+                p.setPen(txt_col)
+                p.drawText(QRect(vx1 + 2, RULER_H, vw - 3, bar_h),
+                           Qt.AlignLeft | Qt.AlignVCenter, short_lbl)
+
+        for t in (self.model.hybrid_switch_times() if self.model.mode_markers else []):
+            x = self.x_of(t)
+            if x < KEY_W or x > w:
+                continue
+            p.setPen(QPen(QColor("#ff5f56"), 2, Qt.DashLine))
+            p.drawLine(int(x), RULER_H, int(x), int(RULER_H + bar_h))
+            p.setPen(QColor("#ff8b84"))
+            p.setFont(QFont("Microsoft YaHei UI", 7, QFont.Bold))
+            p.drawText(QRect(int(x) + 2, RULER_H, 28, bar_h),
+                       Qt.AlignLeft | Qt.AlignVCenter, "⚡Z")
 
     def _paint_notes(self, p, w, h):
         if not self.model.notes:
@@ -1022,17 +1173,22 @@ class PianoRollCanvas(QAbstractScrollArea):
             dropped = bool(a and a.get("dropped"))
             late = bool(a and (_as_float(a.get("late")) > 0.002))
             melody = bool(n.get("is_melody", True))
-            if self.model.kind == "chord":
-                base = QColor("#d2a8ff") if melody else QColor("#79c0ff")
+            mode = self.model.mode_at(n["t"]) if self.model.mode_markers else self.model.kind
+            if mode == "chord":
+                base = QColor("#2f81f7") if melody else QColor("#58a6ff")
             else:
                 base = QColor("#2f81f7") if melody else QColor("#3fb950")
             if dropped:
                 base = QColor("#da3633")
             p.setBrush(base)
-            p.setPen(QPen(QColor("#ffffff") if id(n) in sel else QColor("#0b0f16"), 2 if id(n) in sel else 1))
+            if id(n) in sel:
+                p.setPen(QPen(QColor("#ffffff"), 2))
+            elif r.width() <= 8:
+                p.setPen(Qt.NoPen)
+            else:
+                p.setPen(QPen(QColor("#0b0f16"), 1))
             p.drawRoundedRect(r, 3, 3)
 
-            # 超 4 秒延音上限：尾部虚线
             if n["dur"] > float(self.model.timing.p5 or 4.0):
                 maxx = self.x_of(n["t"] + float(self.model.timing.p5 or 4.0))
                 p.setPen(QPen(QColor("#ffd866"), 1, Qt.DashLine))
@@ -1061,8 +1217,7 @@ class PianoRollCanvas(QAbstractScrollArea):
                     p.setPen(QColor("#ffe6c7"))
                     p.drawText(r, Qt.AlignCenter, "! 扫弦过密 <0.32s")
 
-            # 和声外音（真实切片音级）
-            if self.model.slices and self.model.kind != "chord":
+            if self.model.slices and mode != "chord":
                 s = self.model.slice_at(n["t"])
                 if s is not None:
                     nm = self.model.slices[s].get("name")
@@ -1071,9 +1226,12 @@ class PianoRollCanvas(QAbstractScrollArea):
                             p.setPen(QPen(QColor("#e3b341"), 1, Qt.DashLine))
                             p.drawRect(r.adjusted(0, 0, -1, -1))
 
-            if a and a.get("string") is not None and r.width() > 44 and self.row_h >= 11:
-                txt = "S%dF%d·P%d" % (int(a["string"]), int(a.get("fret") or 0),
-                                      int(a.get("page") or 0) + 1)
+            if a and a.get("string") is not None and r.width() > 40 and self.row_h >= 11:
+                if a.get("fret") is not None:
+                    txt = "S%dF%d·P%d" % (int(a["string"]), int(a.get("fret") or 0),
+                                          int(a.get("page") or 0) + 1)
+                else:
+                    txt = "S%d·P%d" % (int(a["string"]), int(a.get("page") or 0) + 1)
                 p.setPen(QColor("#0b0f16") if melody else QColor("#06210f"))
                 p.drawText(r.adjusted(3, 0, -1, 0), Qt.AlignLeft | Qt.AlignVCenter, txt)
 
@@ -1117,8 +1275,6 @@ class PianoRollCanvas(QAbstractScrollArea):
 
     # ── 交互 ───────────────────────────────────────────────────────────
     def eventFilter(self, obj, ev):
-        """把滚轮事件强制送到本类的 wheelEvent（QAbstractScrollArea 的
-        viewport 在部分鼠标驱动/修饰键组合下会先吃掉滚轮）。"""
         if obj is self.viewport() and ev.type() == QEvent.Wheel:
             self.wheelEvent(ev)
             return True
@@ -1154,14 +1310,12 @@ class PianoRollCanvas(QAbstractScrollArea):
                 self.selectionChanged.emit()
                 self.viewport().update()
             if edge is None:
-                # 在顶部标尺按下 = 定位播放头（拖动期间暂停播放，松手继续）
                 self._seek_drag = True
                 self._seek_x = x
                 self.scrubBegan.emit()
                 self.seekRequested.emit(self.cursor_t)
             return
         if x < KEY_W:
-            # 点左侧钢琴键：直接试听该音高（150ms），并把该键高亮 180ms
             if y >= RULER_H:
                 pitch = _clamp_pitch(self.pitch_of(y))
                 self._pressed_pitch = pitch
@@ -1202,7 +1356,6 @@ class PianoRollCanvas(QAbstractScrollArea):
         if self._seek_drag:
             self._seek_x = ev.pos().x()
             self.seekRequested.emit(max(0.0, self.t_of(ev.pos().x())))
-            # 拖到左右边缘时自动平移，方便长曲定位
             vw = self.viewport().width()
             if self._seek_x > vw - 30:
                 self.horizontalScrollBar().setValue(
@@ -1252,13 +1405,11 @@ class PianoRollCanvas(QAbstractScrollArea):
 
     def x_to_dt(self, dx):
         if self.grid_div > 0:
-            step = self.step_sec()
             t = self.t_of(self._drag["start"].x() + dx)
             return self.snap(t) - self.snap(self.t_of(self._drag["start"].x()))
         return dx / self.pps
 
     def _drag_slice_to(self, st, t):
-        """拖动和弦切片边界（只改时间与标记；音符另由用户拖）。"""
         i = st["i"]
         if not (0 <= i < len(self.model.slices)):
             return
@@ -1289,8 +1440,6 @@ class PianoRollCanvas(QAbstractScrollArea):
         if mode == "rubber" and self._rubber is not None:
             r = self._rubber
             picked = [n for n in self.model.notes if r.intersects(self.note_rect(n))]
-            # 音符是 dict，不能拿 dict.fromkeys 去重（会抛 unhashable type: 'dict'）；
-            # 按对象身份合并，既保留原选择顺序，也不会把同一个音重复加入。
             merged = list(self.selection)
             seen = {id(n) for n in merged}
             for n in picked:
@@ -1306,7 +1455,7 @@ class PianoRollCanvas(QAbstractScrollArea):
                 self.model.end_batch()
                 self.model._sort()
             elif len(self.selection) == 1:
-                self.noteClicked.emit(self.selection[0])   # 单击单音：150ms 短试听
+                self.noteClicked.emit(self.selection[0])
             self.selection = [n for n in self.selection if n in self.model.notes]
             self.commit()
         self._drag = None
@@ -1383,7 +1532,6 @@ class PianoRollCanvas(QAbstractScrollArea):
         anchor = self.t_of(x)
         self.pps = max(18.0, min(900.0, self.pps * factor))
         self._update_scrollbars()
-        # 保持鼠标下的时刻不动
         newx = KEY_W + anchor * self.pps - self.horizontalScrollBar().value()
         self.horizontalScrollBar().setValue(
             int(self.horizontalScrollBar().value() + (newx - x)))
@@ -1396,7 +1544,6 @@ class PianoRollCanvas(QAbstractScrollArea):
         mods = ev.modifiers()
         x = ev.pos().x()
         if (mods & Qt.ControlModifier) and (mods & Qt.AltModifier):
-            # Ctrl+Alt+滚轮：纵向行高缩放（保留旧版能力）
             self.row_h = max(7.0, min(30.0,
                                       self.row_h * (1.1 if d > 0 else 1 / 1.1)))
             self._update_scrollbars()
@@ -1404,21 +1551,17 @@ class PianoRollCanvas(QAbstractScrollArea):
             return
         if (mods & Qt.AltModifier) or ((mods & Qt.ShiftModifier)
                                        and not (mods & Qt.ControlModifier)):
-            # Alt+滚轮（Shift+滚轮作为备用）= 时间轴缩放
             self._zoom_time(1.15 if d > 0 else 1 / 1.15, x)
             return
         if d == 0 and dx != 0:
-            # 鼠标驱动把 Alt+滚轮映射成"横向滚动"时，也按时间缩放处理
             self._zoom_time(1.15 if dx > 0 else 1 / 1.15, x)
             return
         if not d:
             return
         if mods & Qt.ControlModifier:
-            # Ctrl+滚轮：上下滑动（翻音高行）
             self.verticalScrollBar().setValue(
                 self.verticalScrollBar().value() - int(d / 120.0 * self.row_h * 3))
             return
-        # 普通滚轮：前后滑动（时间轴）
         self.horizontalScrollBar().setValue(
             self.horizontalScrollBar().value() - int(d / 120.0 * self.pps * 0.35))
         ev.accept()
@@ -1433,12 +1576,12 @@ class PianoRollCanvas(QAbstractScrollArea):
     def zoom_fit(self):
         self._update_scrollbars()
         cw = max(1, self.viewport().width() - KEY_W)
-        self.pps = max(18.0, min(900.0, (cw - 60) / self._duration()))
+        self.pps = max(45.0, min(900.0, (cw - 60) / self._duration()))
         self._update_scrollbars()
         self.viewport().update()
 
     def center_on_notes(self):
-        """把纵向滚动条对准音符的中位音高（打开时别停在最高音区）。"""
+        """把纵向滚动条对准音符的中位音高。"""
         if not self.model.notes:
             return
         pitches = sorted(int(n["pitch"]) for n in self.model.notes)
@@ -1465,7 +1608,6 @@ class PianoRollDialog(QDialog):
         self._wav = None
         self._wav_path = None
         self._t0 = None
-        # 整谱试听：QMediaPlayer（支持拖动进度）；不可用时退回 winsound
         self.player = None
         self._QMediaContent = None
         self._audio_path = None
@@ -1554,7 +1696,7 @@ class PianoRollDialog(QDialog):
         self.lbl_mode = QLabel("")
         row2.addWidget(self.lbl_mode)
         self.cmb_track = QComboBox()
-        self.cmb_track.setMinimumWidth(140)
+        self.cmb_track.setMinimumWidth(265)
         self.cmb_track.currentIndexChanged.connect(self._switch_track)
         self.lbl_track = QLabel("轨道：")
         row2.addWidget(self.lbl_track)
@@ -1571,12 +1713,14 @@ class PianoRollDialog(QDialog):
         _arp, _rhythm = self.model.roll_flags()
         self.chk_roll_arp.setChecked(_arp)
         self.chk_roll_rhythm.setChecked(_rhythm)
-        self.chk_roll_arp.setToolTip("2P 品格从低到高顺拨 / Solo 长空隙点缀；关闭则只垫根音")
-        self.chk_roll_rhythm.setToolTip("开：按真实单拍扫弦；关：每切片只扫 1 次")
         self.chk_roll_arp.toggled.connect(self._on_roll_flags_changed)
         self.chk_roll_rhythm.toggled.connect(self._on_roll_flags_changed)
+        self.chk_strum_mode = QCheckBox("2P柱式改用鼠标扫弦")
+        self.chk_strum_mode.setChecked(self.model.roll_strum_mode())
+        self.chk_strum_mode.toggled.connect(self._on_strum_mode_changed)
         row2.addWidget(self.chk_roll_arp)
         row2.addWidget(self.chk_roll_rhythm)
+        row2.addWidget(self.chk_strum_mode)
         self.chk_phys_preview = QCheckBox("物理指法与晚出预览（按1P主音）")
         self.chk_phys_preview.setToolTip(
             "模式 A 下勾选：按 1P 主音真实编译，显示 S弦F品·P页 角标、丢弃与晚出预警")
@@ -1585,7 +1729,6 @@ class PianoRollDialog(QDialog):
         row2.addStretch(1)
         root.addLayout(row2)
 
-        # 2P 和弦专属控件（单独一行，避免把轨道/网格挤出屏幕）
         row_chord = QHBoxLayout()
         self.lbl_chord = QLabel("当前和弦：")
         self.cmb_chord = QComboBox()
@@ -1593,7 +1736,7 @@ class PianoRollDialog(QDialog):
             self.cmb_chord.addItem(name, name)
         self.cmb_chord.setMinimumWidth(90)
         self.btn_chord = self._btn("应用到选中切片", "只允许 24 个游戏内和弦", self.apply_chord)
-        self.btn_strum_u = self._btn("＋左键上扫(强)", "已停用：起和弦伴奏一律右键下扫", self.add_strum)
+        self.btn_strum_u = self._btn("＋左键上扫(强)", "已停用：和弦伴奏一律右键下扫", self.add_strum)
         self.btn_strum_u.setVisible(False)
         self.btn_strum_d = self._btn("＋添加扫弦（右键下扫）", "生成 ≥3 音同帧簇，力度 75，右键下扫",
                                      lambda: self.add_strum(False))
@@ -1626,9 +1769,16 @@ class PianoRollDialog(QDialog):
         row_play.addWidget(self.lbl_time)
         root.addLayout(row_play)
 
+        status_row = QHBoxLayout()
         self.lbl_status = QLabel("")
         self.lbl_status.setObjectName("sub")
-        root.addWidget(self.lbl_status)
+        status_row.addWidget(self.lbl_status, 1)
+        self.lbl_legend = QLabel("")
+        self.lbl_legend.setObjectName("sub")
+        self.lbl_legend.setTextFormat(Qt.RichText)
+        self.lbl_legend.setWordWrap(False)
+        status_row.addWidget(self.lbl_legend, 0)
+        root.addLayout(status_row)
 
         self._timer = QTimer(self)
         self._timer.setInterval(40)
@@ -1650,15 +1800,16 @@ class PianoRollDialog(QDialog):
         else:
             self.lbl_track.setText("演奏模式：")
             for role in (MC.ROLE_SOLO, MC.ROLE_DUET_LEAD,
-                         MC.ROLE_DUET_RHYTHM, MC.ROLE_DUET_RHYTHM_FRET):
+                         MC.ROLE_DUET_RHYTHM_FRET, MC.ROLE_DUET_RHYTHM):
                 self.cmb_track.addItem(PLAY_ROLE_LABELS[role], role)
             idx = self.cmb_track.findData(self.model.role)
             self.cmb_track.setCurrentIndex(max(0, idx))
             self.cmb_track.setEnabled(True)
         self.cmb_track.blockSignals(False)
         if self.model.mode == "role":
-            role_cn = (self.model.tl or {}).get("role_cn") or ""
-            self.lbl_mode.setText("模式 B：%s（%s）" % (role_cn, "品格" if self.model.kind == "fret" else "和弦"))
+            role_cn = PLAY_ROLE_LABELS.get(self.model.role) or (self.model.tl or {}).get("role_cn") or ""
+            mode_tag = "智能混切" if self.model.role in (MC.ROLE_DUET_RHYTHM, MC.ROLE_DUET_RHYTHM_FRET) else "品格"
+            self.lbl_mode.setText("模式 B：%s（%s）" % (role_cn, mode_tag))
         else:
             self.lbl_mode.setText("模式 A：通用 MIDI（%s）" % os.path.basename(self.model.path or ""))
         self.btn_fix.setVisible(self.model.mode == "midi")
@@ -1669,14 +1820,19 @@ class PianoRollDialog(QDialog):
             pass
         self.btn_restore.setVisible(self.model.mode == "role")
         self.btn_apply.setVisible(self.model.mode == "role")
-        for w in (self.chk_roll_arp, self.chk_roll_rhythm):
+        self._update_legend()
+        self._update_switch_availability()
+        for w in (self.chk_roll_arp, self.chk_roll_rhythm, self.chk_strum_mode):
             w.setVisible(self.model.mode == "role")
 
     def _chord_widgets_visible(self, on):
+        show_bar = bool(on) and self.model.mode == "role"
         for w in (self.lbl_chord, self.cmb_chord, self.btn_chord,
-                  self.btn_strum_u, self.btn_strum_d, self.cmb_string, self.btn_pluck):
-            w.setVisible(bool(on))
-        self.btn_strum_u.setVisible(False)   # 左键上扫已停用
+                  self.cmb_string, self.btn_pluck):
+            w.setVisible(show_bar)
+        # 角色 3（2P 琶音/根音）全程纯拨弦 0 鼠标扫弦，仅在角色 4（柱式/扫弦）下显示添加扫弦按钮
+        self.btn_strum_d.setVisible(show_bar and self.model.role == MC.ROLE_DUET_RHYTHM)
+        self.btn_strum_u.setVisible(False)
 
     def _on_roll_flags_changed(self, _checked=None):
         """卷帘内切换琶音 / 扫弦律动：写回配置并实时重算 2P 与 Solo。"""
@@ -1695,6 +1851,31 @@ class PianoRollDialog(QDialog):
         self.canvas.viewport().update()
         self._invalidate_audio_preview()
         self._notify_parent_flags(arp, rhythm)
+
+    def _on_strum_mode_changed(self, _checked=None):
+        """卷帘内切换"柱式 / 鼠标扫弦"：写回配置、重算 2P，并作废旧试听音频。"""
+        if self.model.mode != "role":
+            return
+        on = self.chk_strum_mode.isChecked()
+        if on == self.model.roll_strum_mode():
+            return
+        self.model._snapshot()
+        self.model.rebuild_for_strum_mode(on)
+        self.canvas.selection = []
+        self._chord_widgets_visible(self.model.kind == "chord")
+        self._fill_tracks()
+        self._refresh_buttons()
+        self.canvas.viewport().update()
+        self._invalidate_audio_preview()
+        par = self.parent()
+        box = getattr(par, "chk_strum_mode", None)
+        if box is not None:
+            try:
+                box.blockSignals(True)
+                box.setChecked(bool(on))
+                box.blockSignals(False)
+            except Exception:
+                pass
 
     def _notify_parent_flags(self, arp, rhythm):
         par = self.parent()
@@ -1716,18 +1897,62 @@ class PianoRollDialog(QDialog):
             except Exception:
                 pass
 
+    def _update_legend(self):
+        """按当前角色刷新颜色图例（右下角常驻）。"""
+        blue = "<span style='color:#58a6ff'>■</span>"
+        green = "<span style='color:#3fb950'>■</span>"
+        red = "<span style='color:#ff7b72'>■</span>"
+        amber = "<span style='color:#ffa657'>□</span>"
+        role = self.model.role if self.model.mode == "role" else None
+        if role == MC.ROLE_SOLO:
+            body = "%s蓝=主旋律  %s绿=伴奏  %s红=冲突不可弹  %s橙框=晚出" % (
+                blue, green, red, amber)
+        elif role in (MC.ROLE_DUET_RHYTHM, MC.ROLE_DUET_RHYTHM_FRET):
+            body = "%s蓝=和弦模式  %s绿=品格模式(Z混切)  %s红=冲突不可弹  %s橙框=晚出" % (
+                blue, green, red, amber)
+        else:
+            body = "%s蓝=主旋律  %s红=冲突不可弹  %s橙框=晚出" % (blue, red, amber)
+        try:
+            self.lbl_legend.setText("图例：" + body)
+        except Exception:
+            pass
+
+    def _update_switch_availability(self):
+        """按当前角色自动启用/置灰三个伴奏开关，并给置灰控件加明显半透明样式。"""
+        role = self.model.role if self.model.mode == "role" else None
+        arp_on = role in (MC.ROLE_SOLO, MC.ROLE_DUET_RHYTHM_FRET)
+        rhy_on = role == MC.ROLE_DUET_RHYTHM
+        str_on = role == MC.ROLE_DUET_RHYTHM
+        specs = (
+            (getattr(self, "chk_roll_arp", None), arp_on,
+             "本角色有效：1P 独奏的句间点缀 / 2P 琶音的顺拨分解",
+             "当前角色不使用「和弦内音琶音」（仅 1P 独奏与 2P 琶音/根音有效）"),
+            (getattr(self, "chk_roll_rhythm", None), rhy_on,
+             "本角色有效：2P 柱式/扫弦的整拍律动（和弦段与品格段同步生效）",
+             "当前角色不使用「和弦扫弦律动」（仅 2P 柱式/扫弦有效）"),
+            (getattr(self, "chk_strum_mode", None), str_on,
+             "本角色有效：2P 柱式/扫弦的发声方式切换",
+             "当前角色不使用「柱式/扫弦」开关（仅 2P 柱式/扫弦有效）"),
+        )
+        for w, on, tip_on, tip_off in specs:
+            if w is None:
+                continue
+            try:
+                w.setEnabled(bool(on))
+                w.setStyleSheet("" if on else "color: #475569;")
+                w.setToolTip(tip_on if on else tip_off)
+            except Exception:
+                pass
+
     def _refresh_buttons(self):
         self.btn_undo.setEnabled(bool(self.model._undo))
         self.btn_redo.setEnabled(bool(self.model._redo))
-        # 按钮权限收敛
-        #   * 「打开 MIDI…」永远隐藏（换歌一律回主界面操作）；
-        #   * 「保存覆盖原 MIDI」只对扒谱过程（模式 A：role=None）开放，
-        #     演奏端（模式 B）严禁覆盖原 MIDI，只能另存 / 恢复默认 / 应用微调。
         role = getattr(self.model, "role", None)
         mode_a = role is None
         self.btn_open.setVisible(False)
         self.btn_save.setVisible(bool(mode_a))
         self.btn_save_as.setVisible(True)
+        self._update_switch_availability()
         if self.model.kind == "chord":
             name = self.model.slice_at(self.canvas.cursor_t) if self.model.slices else None
             if name is not None:
@@ -1763,17 +1988,15 @@ class PianoRollDialog(QDialog):
             return ""
 
     def _check_can_save_or_apply(self, show_dialog=True):
-        """红色非法音符硬拦截；返回 True 才允许保存/应用。
-
-        show_dialog=False 供门禁测试使用，不弹阻塞框，只写 self.last_invalid。
-        """
+        """红色非法音符硬拦截；返回 True 才允许保存/应用。"""
         if self.model.mode != "role" and not self.chk_phys_preview.isChecked():
             return True
         if self.model.mode == "role":
-            self.model.compile()
-        elif self.chk_phys_preview.isChecked():
-            self._compile_phys()
-        bad = self.model.invalid_notes()
+            _ok, bad = self.model.save_guard()
+        else:
+            if self.chk_phys_preview.isChecked():
+                self._compile_phys()
+            bad = self.model.invalid_notes()
         self.last_invalid = bad
         if not bad:
             return True
@@ -1799,7 +2022,6 @@ class PianoRollDialog(QDialog):
         self._refresh_buttons()
         self._set_status(self.model.status_text() + " ｜ " + self._timing_text())
 
-
     def undo(self):
         if self.model.undo():
             self.canvas.selection = []
@@ -1823,6 +2045,7 @@ class PianoRollDialog(QDialog):
                 self._chord_widgets_visible(self.model.kind == "chord")
                 self._fill_tracks()
                 self._refresh_buttons()
+                self.canvas.center_on_notes()
                 self.canvas.viewport().update()
                 self._invalidate_audio_preview()
             return
@@ -1841,15 +2064,16 @@ class PianoRollDialog(QDialog):
         role = None
         if self.model.mode == "role":
             from PyQt5.QtWidgets import QInputDialog
-            items = [MC.ROLE_CN[r] for r in (MC.ROLE_SOLO, MC.ROLE_DUET_LEAD,
-                                             MC.ROLE_DUET_RHYTHM,
-                                             MC.ROLE_DUET_RHYTHM_FRET)]
+            roles_order = (MC.ROLE_SOLO, MC.ROLE_DUET_LEAD,
+                           MC.ROLE_DUET_RHYTHM_FRET, MC.ROLE_DUET_RHYTHM)
+            items = [PLAY_ROLE_LABELS[r] for r in roles_order]
             cn, ok = QInputDialog.getItem(self, "选择角色", "按哪个角色打开？", items, 0, False)
             if not ok:
                 return
-            role = (MC.ROLE_SOLO, MC.ROLE_DUET_LEAD, MC.ROLE_DUET_RHYTHM,
-                    MC.ROLE_DUET_RHYTHM_FRET)[items.index(cn)]
+            role = roles_order[items.index(cn)]
         try:
+            self.model.song = None
+            self.model.role_notes = {}
             self.model.load(path, role=role)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "打开失败", "这个文件打不开：\n%s\n\n%s"
@@ -1875,13 +2099,17 @@ class PianoRollDialog(QDialog):
             return
         self._do_save(self.model.path)
 
-    def save_as(self):
+    def save_as(self, path=None):
+        """另存为新 MIDI；`path` 为空时弹文件对话框。"""
         if not self._check_can_save_or_apply():
-            return
-        path, _ = QFileDialog.getSaveFileName(self, "另存为 MIDI", _out_dir(),
-                                              "MIDI (*.mid)")
+            return None
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(self, "另存为 MIDI", _out_dir(),
+                                                  "MIDI (*.mid)")
         if path:
             self._do_save(path)
+            return path
+        return None
 
     def _do_save(self, path):
         if not self._check_can_save_or_apply():
@@ -1987,7 +2215,6 @@ class PianoRollDialog(QDialog):
 
     # ── 试听 ───────────────────────────────────────────────────────────
     def _play_wav(self, data):
-        """单音短试听：把 WAV 字节落成临时文件再异步播放（winsound）。"""
         import tempfile
         import winsound
         self._stop_wav()
@@ -2030,7 +2257,6 @@ class PianoRollDialog(QDialog):
                    default=0.0)
 
     def _preview_note(self, note):
-        """单击单音 / 点琴键：150ms 短促试听（整谱播放中不打断）。"""
         try:
             name = PianoRollCanvas._pitch_name(int(note["pitch"]))
             if self._playing:
@@ -2069,13 +2295,11 @@ class PianoRollDialog(QDialog):
         return PianoRollModel.synthesize_wav(self.model.notes, self.model.bpm)
 
     def _build_audio(self):
-        """把当前谱面合成整段 WAV 并交给播放器；返回 True/False。"""
         if self.player is None or self._QMediaContent is None:
             return False
         import tempfile
         data = self.preview_wav_bytes()
         self._cleanup_audio()
-        # 重新写临时 WAV 之前再放一次句柄，避免 Windows 下的 PermissionError
         try:
             if self.player is not None and self._QMediaContent is not None:
                 self.player.setMedia(self._QMediaContent())
@@ -2103,7 +2327,6 @@ class PianoRollDialog(QDialog):
         self.canvas.viewport().update()
 
     def _compile_phys(self):
-        """模式 A：按 1P 主音真实编译，给原始 MIDI 也画出指法/晚出。"""
         if self.model.mode != "midi" or not self.model.path:
             return
         try:
@@ -2145,7 +2368,6 @@ class PianoRollDialog(QDialog):
             self._playing = False
 
     def _begin_scrub(self):
-        """拖动播放指针：播放中先暂停，避免一路扫过音符发出噪音。"""
         self._scrub_was_playing = self._playing
         if self._playing:
             self.pause_preview()
@@ -2157,7 +2379,6 @@ class PianoRollDialog(QDialog):
             self.preview()
 
     def toggle_play(self):
-        """空格 / 按钮：播放 ↔ 暂停。"""
         if self._playing:
             self.pause_preview()
         elif self._paused:
@@ -2216,7 +2437,6 @@ class PianoRollDialog(QDialog):
                 pass
         start = max(0.0, float(self.canvas.playhead or 0.0))
         if self.player is None:
-            # 退回 winsound：不支持拖动，但至少能听
             try:
                 data = PianoRollModel.synthesize_wav(self.model.notes, self.model.bpm)
                 self._play_wav(data)
@@ -2237,7 +2457,7 @@ class PianoRollDialog(QDialog):
                 if not self._build_audio():
                     return
             dur = max(0.05, self._audio_duration or self._notes_end())
-            if start >= dur - 0.10:          # 播到结尾再按空格 = 从头开始
+            if start >= dur - 0.10:
                 start = 0.0
             start = min(start, max(0.0, dur - 0.05))
             self._pending_seek_ms = int(start * 1000)
@@ -2246,7 +2466,6 @@ class PianoRollDialog(QDialog):
             if self.player.mediaStatus() in (QMediaPlayer.LoadedMedia,
                                              QMediaPlayer.BufferedMedia):
                 self._apply_pending_play()
-            # 否则等 mediaStatusChanged 回调再 play
             self._update_progress(start)
             self._set_status("试听中…（%d 音，%.1f 秒；拖底部滑块可跳转）"
                              % (len(self.model.notes), dur))
@@ -2274,7 +2493,6 @@ class PianoRollDialog(QDialog):
         try:
             if self.player is not None:
                 self.player.stop()
-                # Windows 会继续锁住试听用的临时 WAV，显式清空 media 才释放句柄
                 if self._QMediaContent is not None:
                     self.player.setMedia(self._QMediaContent())
             else:
@@ -2285,7 +2503,6 @@ class PianoRollDialog(QDialog):
         self.canvas.viewport().update()
 
     def seek_to(self, t):
-        """定位播放头；正在播放/暂停时直接跳转（不重新合成）。"""
         dur = self._audio_duration or self._notes_end()
         t = max(0.0, min(float(t), max(0.05, dur)))
         self.canvas.playhead = t
@@ -2328,7 +2545,6 @@ class PianoRollDialog(QDialog):
             self.preview()
 
     def _on_edit_committed(self):
-        """谱面改动：试听缓存失效；正在播放/暂停就先停下来，避免改到一半报错。"""
         self._audio_dirty = True
         self._audio_duration = self._notes_end()
         if self._playing or self._paused:
