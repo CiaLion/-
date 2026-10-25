@@ -451,7 +451,7 @@ function Install-Requirements([string]$VenvPython, [string]$ReqFile, [string]$La
         return
     }
     Write-Host ('  installing ' + $Label + ' from ' + (Split-Path -Leaf $ReqFile))
-    Install-WithMirrorFallback $VenvPython @('-m', 'pip', 'install', '-r', $ReqFile) $Label
+        Install-WithMirrorFallback $VenvPython @('-m', 'pip', 'install', '--upgrade-strategy', 'only-if-needed', '-r', $ReqFile) $Label
     Write-Ok ($Label + ' dependencies installed')
 }
 
