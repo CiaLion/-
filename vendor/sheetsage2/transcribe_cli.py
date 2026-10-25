@@ -29,7 +29,46 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 sys.path.insert(0, str(SHEETSAGE2_DIR))
 sys.path.insert(0, str(WEBUI_ROOT))
 
+# 1. 屏蔽 Windows 系统级 DLL 找不到入口点的模态弹窗
+if os.name == "nt":
+    try:
+        import ctypes
+        ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+    except Exception:
+        pass
+
 import torch
+
+# 2. 拦截 torchaudio 非必需 C++ 扩展 (.pyd) 版本错位崩溃，并注入空模块防止下一行 import 报错
+try:
+    _orig_load_lib = torch.ops.load_library
+
+    def _safe_load_lib(path):
+        try:
+            return _orig_load_lib(path)
+        except OSError:
+            if "torchaudio" in str(path).lower():
+                import types
+                m = types.ModuleType("torchaudio.lib._torchaudio")
+                m.cuda_version = lambda: None
+                sys.modules.setdefault("torchaudio.lib", types.ModuleType("torchaudio.lib"))
+                sys.modules["torchaudio.lib._torchaudio"] = m
+                return False
+            raise
+
+    torch.ops.load_library = _safe_load_lib
+except Exception:
+    pass
+
+# 3. 自动挂载 imageio_ffmpeg 内置解码器，防止纯净电脑无系统 ffmpeg 无法读取 .m4a/.aac
+try:
+    import imageio_ffmpeg
+    _ff_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    if _ff_exe and os.path.isfile(_ff_exe):
+        _ff_dir = os.path.dirname(_ff_exe)
+        os.environ["PATH"] = _ff_dir + os.pathsep + os.environ.get("PATH", "")
+except Exception:
+    pass
 from transformers import AutoConfig, AutoModel
 
 from hardware_router import select_attention, select_dtype
@@ -88,7 +127,8 @@ def clean_system_hf_cache():
     removed = False
     base = Path.home() / ".cache" / "huggingface" / "modules" / "transformers_modules"
     for child in base.glob("*") if base.is_dir() else []:
-        if child.name == "SheetSage2" or "MERT" in child.name:
+        # 精确匹配本项目用到的两个模型目录，避免误删用户的其它 MERT 变体
+        if child.name in ("SheetSage2", "MERT-v2-FullSong"):
             shutil.rmtree(child, ignore_errors=True)
             removed = True
     return removed

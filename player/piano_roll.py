@@ -1603,7 +1603,9 @@ class PianoRollDialog(QDialog):
     def __init__(self, path=None, role=None, parent=None, on_apply=None):
         super(PianoRollDialog, self).__init__(parent)
         self.setWindowTitle("《异键演奏》钢琴卷帘微调")
-        self.resize(1280, 760)
+        avail = QApplication.desktop().availableGeometry(self)
+        self.resize(min(1280, int(avail.width() * 0.94)),
+                    min(760, int(avail.height() * 0.88)))
         self.on_apply = on_apply
         self._wav = None
         self._wav_path = None

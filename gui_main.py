@@ -30,9 +30,9 @@ if _QT_PLUGINS.is_dir() and not os.environ.get("QT_PLUGIN_PATH"):
 from PyQt5.QtCore import (QPoint, QProcess, QRect, Qt, QThread, QTimer,
                           pyqtSignal)  # noqa: E402
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QTextCursor  # noqa: E402
-from PyQt5.QtWidgets import (QApplication, QDialog, QHBoxLayout, QLabel,  # noqa: E402
+from PyQt5.QtWidgets import (QApplication, QDialog, QFrame, QHBoxLayout, QLabel,
                              QMainWindow, QMessageBox, QPlainTextEdit,
-                             QProgressBar, QPushButton, QTabWidget,
+                             QProgressBar, QPushButton, QScrollArea, QTabWidget,
                              QVBoxLayout, QWidget)
 
 import gui_a_legacy as AGui  # noqa: E402
@@ -77,7 +77,12 @@ class WheelOverlayDialog(QDialog):
             self._client = tuple(m)
         else:
             self._client = (0, 0, 1920, 1080)
-        # 覆盖层铺满整个虚拟桌面：指示圈/控制条拖到游戏窗口外面也仍然看得见
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                None, "游戏未启动",
+                "未检测到游戏窗口，本次校准将按 1920x1080 推算比例。\n"
+                "如果你实际屏幕不是 1920x1080，比例会偏，请先启动游戏再校准。"
+            )
         geo = QApplication.desktop().geometry()
         self.setGeometry(geo)
         left, top, cw, ch = self._client
@@ -539,7 +544,11 @@ class UnifiedWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("异键演奏")
-        self.resize(1180, 900)
+        avail = QApplication.desktop().availableGeometry(self)
+        self.resize(min(1180, int(avail.width() * 0.92)),
+                    min(880, int(avail.height() * 0.90)))
+        self.setMinimumSize(min(820, int(avail.width() * 0.80)),
+                            min(540, int(avail.height() * 0.75)))
         root = QWidget()
         self.setCentralWidget(root)
         lay = QVBoxLayout(root)
@@ -583,16 +592,26 @@ class UnifiedWindow(QMainWindow):
         self.chk_auto_send.setCheckable(True)
         self.chk_auto_send.hide()
         if a_central is not None:
-            la.addWidget(a_central, 1)
+            la.setContentsMargins(0, 0, 0, 0)
+            sa = QScrollArea()
+            sa.setWidgetResizable(True)
+            sa.setFrameShape(QFrame.NoFrame)
+            sa.setWidget(a_central)
+            la.addWidget(sa, 1)
         self.tabs.addTab(self.tab_a, "AI 智能扒谱（音频转 MIDI）")
 
         # 标签 2：演奏
         self.tab_b = QWidget()
         lb = QVBoxLayout(self.tab_b)
+        lb.setContentsMargins(0, 0, 0, 0)
         self.b = BGui.MainWindow()
         b_central = self.b.takeCentralWidget()
         if b_central is not None:
-            lb.addWidget(b_central, 1)
+            sb = QScrollArea()
+            sb.setWidgetResizable(True)
+            sb.setFrameShape(QFrame.NoFrame)
+            sb.setWidget(b_central)
+            lb.addWidget(sb, 1)
         self.tabs.addTab(self.tab_b, "吉他自动演奏（编译与键鼠执行）")
 
         # 一键全流程完成后自动送入演奏台
@@ -770,14 +789,30 @@ def main(argv=None):
     # High-DPI 抗锯齿（必须在 QApplication 创建之前设置）
     try:
         from PyQt5.QtCore import Qt, QCoreApplication
+        from PyQt5.QtGui import QGuiApplication
         QCoreApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
         QCoreApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+        if hasattr(Qt, "HighDpiScaleFactorRoundingPolicy"):
+            QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+                Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     except Exception:
         pass
     # 让任务栏把本程序当成独立应用（用自己的图标，不跟 python 合并）
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
             "YijianYanzou.Desktop")
+        
+        if os.name == "nt":
+            k32 = ctypes.windll.kernel32
+            k32.SetPriorityClass(k32.GetCurrentProcess(), 0x00008000)  # ABOVE_NORMAL_PRIORITY_CLASS
+
+            class _POWER_THROTTLING(ctypes.Structure):
+                _fields_ = [("Version", ctypes.c_ulong),
+                            ("ControlMask", ctypes.c_ulong),
+                            ("StateMask", ctypes.c_ulong)]
+
+            pt = _POWER_THROTTLING(1, 0x3, 0x0)  # 禁用后台降频(0x1) + 禁用忽略高精度时钟(0x2)
+            k32.SetProcessInformation(k32.GetCurrentProcess(), 4, ctypes.byref(pt), ctypes.sizeof(pt))
     except Exception:
         pass
     app = QApplication(argv)

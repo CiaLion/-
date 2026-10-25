@@ -77,6 +77,7 @@ function Test-UrlHead([string]$Url, [int]$TimeoutSec = 2) {
     }
     $envProxy = $env:HTTPS_PROXY
     if (-not $envProxy) { $envProxy = $env:HTTP_PROXY }
+    if (-not $envProxy) { $envProxy = $env:ALL_PROXY }
     if ($envProxy) { $params['Proxy'] = $envProxy }
     try {
         $resp = Invoke-WebRequest @params
@@ -187,21 +188,42 @@ function Get-TorchSubdir([string]$Which) {
 # ---------------------------------------------------------------- backend
 function Get-DisplayAdapters {
     $names = @()
+
+    # 1) WMI/CIM: primary, reliable, returns all video controllers
     try {
-        $cls = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
-        $names += Get-ChildItem $cls -ErrorAction Stop |
-                  ForEach-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DriverDesc } |
-                  Where-Object { $_ }
+        $cim = Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop
+        foreach ($c in $cim) {
+            if ($c.Name) { $names += [string]$c.Name }
+        }
     } catch { }
-    try {
-        $video = 'HKLM:\SYSTEM\CurrentControlSet\Control\Video'
-        $names += Get-ChildItem $video -ErrorAction Stop |
-                  ForEach-Object {
-                      Get-ChildItem $_.PSPath -ErrorAction SilentlyContinue |
-                      ForEach-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DriverDesc }
-                  } | Where-Object { $_ }
-    } catch { }
+
+    # 2) Registry fallback (only when CIM returned nothing)
+    if ($names.Count -eq 0) {
+        try {
+            $cls = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+            $names += Get-ChildItem $cls -ErrorAction Stop |
+                      ForEach-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DriverDesc } |
+                      Where-Object { $_ }
+        } catch { }
+        try {
+            $video = 'HKLM:\SYSTEM\CurrentControlSet\Control\Video'
+            $names += Get-ChildItem $video -ErrorAction Stop |
+                      ForEach-Object {
+                          Get-ChildItem $_.PSPath -ErrorAction SilentlyContinue |
+                          ForEach-Object { (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DriverDesc }
+                      } | Where-Object { $_ }
+        } catch { }
+    }
+
     return @($names | Where-Object { $_ } | Select-Object -Unique)
+}
+
+# Optional: drop obvious virtual display adapters before backend selection
+function Get-PhysicalAdapters([string[]]$Names) {
+    $virtual = 'ToDesk|Sunlogin|Oray|Parsec|Splashtop|AnyDesk|TeamViewer|Rainway|Moonlight|' +
+           'Virtual Display|Indirect Display|IddCx|USB Display|DisplayLink|' +
+           'VMware|VirtualBox|Hyper-V|Citrix|Basic Display|Remote Display'
+    return @($Names | Where-Object { $_ -notmatch $virtual })
 }
 
 function Get-NvidiaSmiPath {
@@ -248,7 +270,7 @@ function Get-NvidiaComputeMajor {
 
 function Select-Backend([string]$Adapters, [bool]$NvidiaSmi, [bool]$ZeLoader) {
     if ($Adapters -match 'NVIDIA|GeForce|Quadro|Tesla' -or $NvidiaSmi) { return 'cuda' }
-    if ($Adapters -match 'Intel' -or $ZeLoader) { return 'xpu' }
+    if ($Adapters -match 'Intel.*Arc|Arc\(TM\)') { return 'xpu' }
     # AMD cards run on the CPU. GPU acceleration is only offered for NVIDIA
     # (CUDA) and Intel Arc (XPU), which are the two backends this build ships.
     if ($Adapters -match 'AMD|Radeon') { return 'cpu' }
@@ -258,17 +280,35 @@ function Select-Backend([string]$Adapters, [bool]$NvidiaSmi, [bool]$ZeLoader) {
 function Detect-Backend {
     $adapters = @(Get-DisplayAdapters)
     $joined = ($adapters -join ' | ')
+    Write-LogLine ('[gpu] all adapters: ' + $joined)
+
+    $physical = @(Get-PhysicalAdapters $adapters)
+    if ($physical.Count -eq 0) {
+        # All adapters were classified as virtual; don't lose info -- fall back to full list
+        Write-LogLine ('[gpu] all adapters classified as virtual, falling back to full list')
+        $physical = $adapters
+    }
+    $physJoined = ($physical -join ' | ')
+    if ($physical.Count -gt 0 -and $physical.Count -ne $adapters.Count) {
+        Write-LogLine ('[gpu] physical adapters: ' + $physJoined)
+    }
+
     $nvidiaSmi = Test-NvidiaSmi
     $zeLoader = Test-Path (Join-Path $env:WINDIR 'System32\ze_loader.dll')
-    $which = Select-Backend $joined $nvidiaSmi $zeLoader
+
+    # Prefer physical list for selection; nvidia-smi / ze_loader still act as fallbacks
+    $which = Select-Backend $physJoined $nvidiaSmi $zeLoader
+
     if ($which -eq 'cpu') {
-        if ($joined -match 'AMD|Radeon') {
-            Write-Host ('  [gpu] AMD detected: ' + $joined + ' -> CPU')
+        if ($physJoined -match 'AMD|Radeon') {
+            Write-Host ('  [gpu] AMD detected: ' + $physJoined + ' -> CPU')
         } else {
-            Write-Host ('  [gpu] no discrete GPU detected: ' + $joined)
+            Write-Host ('  [gpu] no discrete GPU detected: ' + $physJoined)
         }
+        Write-LogLine ('[gpu] backend=cpu adapters=' + $physJoined)
     } else {
-        Write-Host ('  [gpu] ' + $which + ' detected: ' + $joined)
+        Write-Host ('  [gpu] ' + $which + ' detected: ' + $physJoined)
+        Write-LogLine ('[gpu] backend=' + $which + ' adapters=' + $physJoined)
     }
     return $which
 }
@@ -417,7 +457,7 @@ function Install-Requirements([string]$VenvPython, [string]$ReqFile, [string]$La
 
 function Test-Imports([string]$VenvPython, [string[]]$Modules) {
     if (-not (Test-Path -LiteralPath $VenvPython)) { return $false }
-    $code = 'import ' + ($Modules -join ', ') + '; print(12345)'
+    $code = 'import ctypes; ctypes.windll.kernel32.SetErrorMode(0x8003); import ' + ($Modules -join ', ') + '; print(12345)'
     $oldEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
@@ -431,7 +471,7 @@ function Test-Imports([string]$VenvPython, [string[]]$Modules) {
 }
 
 function Test-S2BackendReady([string]$VenvPython, [string]$Which) {
-    if (-not (Test-Imports $VenvPython @('torch', 'torchaudio', 'transformers', 'librosa', 'scipy', 'numba', 'imageio_ffmpeg'))) {
+    if (-not (Test-Imports $VenvPython @('torch', 'torchaudio', 'torchaudio.transforms', 'transformers', 'librosa', 'scipy', 'numba', 'imageio_ffmpeg'))) {
         return $false
     }
     if ($Which -eq 'cuda') {
@@ -467,7 +507,7 @@ function Install-Torch([string]$VenvPython, [string]$Which, [string]$Label) {
             $packages = @('torch==2.7.0+xpu', 'torchaudio==2.7.0+xpu')
         }
         default {
-            $packages = @('torch==2.5.1', 'torchaudio==2.5.1')
+            $packages = @('torch==2.5.1+cpu', 'torchaudio==2.5.1+cpu')
         }
     }
 
@@ -514,8 +554,11 @@ function Install-Torch([string]$VenvPython, [string]$Which, [string]$Label) {
     }
 
     if ($Which -eq 'cpu') {
-        Write-Warn2 'cpu wheels not on the mirrors, falling back to the PyPI mirror'
-        Install-WithMirrorFallback $VenvPython (@('-m', 'pip', 'install') + $packages) 'torch cpu fallback'
+        Write-Warn2 'cpu wheels not on the mirrors, falling back to the official PyTorch CPU index'
+        Invoke-Py $VenvPython (@('-m', 'pip', 'install') + $packages + @(
+            '--index-url', 'https://download.pytorch.org/whl/cpu',
+            '--disable-pip-version-check', '--retries', '5', '--timeout', '120'
+        ))
         Write-Ok ('torch installed (fallback, ' + $Which + ')')
         return
     }
@@ -533,7 +576,18 @@ function Show-Status {
 
     Write-Step 'Environment status'
     Write-Host ('  detected backend: ' + $Which + '   (torch index: ' + (Get-TorchIndex $Which) + ')')
-
+	
+    $allAdapters = @(Get-DisplayAdapters)
+    $physAdapters = @(Get-PhysicalAdapters $allAdapters)
+    Write-Host ('  display adapters (' + $allAdapters.Count + ' total, ' + $physAdapters.Count + ' physical):')
+    foreach ($a in $allAdapters) {
+        if ($physAdapters -contains $a) {
+            Write-Host ('    - ' + $a)
+        } else {
+            Write-Host ('    - ' + $a + '   [virtual]') -ForegroundColor DarkGray
+        }
+    }
+	
     foreach ($item in @(
         @{ Name = 'main venv       '; Path = Join-Path $MainVenv 'Scripts\python.exe' },
         @{ Name = 'sheetsage2 venv '; Path = Join-Path $S2Venv 'Scripts\python.exe' }

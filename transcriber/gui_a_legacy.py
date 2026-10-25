@@ -157,8 +157,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        self.resize(1180, 980)
-        self.setMinimumSize(920, 720)
+        self.resize(1080, 780)
+        self.setMinimumSize(760, 520)
 
         self.worker = None
         self.probe = None
@@ -489,8 +489,7 @@ class MainWindow(QMainWindow):
         self.log_view.setObjectName("log")
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(6000)
-        self.log_view.setMinimumHeight(110)
-        self.log_view.setMaximumHeight(190)
+        self.log_view.setMinimumHeight(80)
         lay.addWidget(self.log_view, 1)
         return frame
 
@@ -716,7 +715,10 @@ class MainWindow(QMainWindow):
         win = data.get("window") or {}
         if isinstance(win.get("size"), list) and len(win["size"]) == 2:
             try:
-                self.resize(int(win["size"][0]), int(win["size"][1]))
+                avail = QApplication.desktop().availableGeometry(self)
+                w = min(int(win["size"][0]), int(avail.width() * 0.92))
+                h = min(int(win["size"][1]), int(avail.height() * 0.88))
+                self.resize(max(760, w), max(520, h))
             except Exception:  # noqa: BLE001
                 pass
 
