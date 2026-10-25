@@ -32,8 +32,8 @@ from PyQt5.QtCore import (QPoint, QProcess, QRect, Qt, QThread, QTimer,
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QTextCursor  # noqa: E402
 from PyQt5.QtWidgets import (QApplication, QDialog, QFrame, QHBoxLayout, QLabel,
                              QMainWindow, QMessageBox, QPlainTextEdit,
-                             QProgressBar, QPushButton, QScrollArea, QTabWidget,
-                             QVBoxLayout, QWidget)
+                             QProgressBar, QPushButton, QScrollArea, QSizePolicy,
+                             QTabWidget, QVBoxLayout, QWidget)
 
 import gui_a_legacy as AGui  # noqa: E402
 import gui_b_legacy as BGui  # noqa: E402
@@ -41,8 +41,24 @@ import game_io as GIO  # noqa: E402
 import player_config as PC  # noqa: E402
 import midi_compiler as MC  # noqa: E402
 import gui_theme as GT  # noqa: E402
+import updater  # noqa: E402
 
 SECTOR_ANGLES = GIO.SECTOR_ANGLES
+
+
+def fit_screen(widget, width, height, min_w=560, min_h=420):
+    """把窗口尺寸夹到当前屏幕可用区域，小屏/高缩放下不越界。"""
+    try:
+        avail = QApplication.desktop().availableGeometry(widget)
+        width = min(int(width), int(avail.width() * 0.94))
+        height = min(int(height), int(avail.height() * 0.90))
+        min_w = min(int(min_w), int(avail.width() * 0.70))
+        min_h = min(int(min_h), int(avail.height() * 0.65))
+    except Exception:
+        pass
+    widget.resize(max(min_w, width), max(min_h, height))
+    widget.setMinimumSize(min_w, min_h)
+    return widget
 
 def _is_dark_mode():
     env = (os.environ.get("DSH_GUI_THEME") or "").strip().lower()
@@ -241,8 +257,7 @@ class EnvCheckDialog(QDialog):
     def __init__(self, parent=None):
         super(EnvCheckDialog, self).__init__(parent)
         self.setWindowTitle("环境与显卡体检 / 一键安装")
-        self.resize(820, 680)
-        self.setMinimumSize(720, 580)
+        fit_screen(self, 820, 680, 560, 420)
         self._worker = None
         self._proc = None
         self._mode = "idle"  # "idle" | "check" | "install"
@@ -538,6 +553,270 @@ class EnvCheckDialog(QDialog):
         super(EnvCheckDialog, self).closeEvent(ev)
 
 
+class UpdateDialog(QDialog):
+    """检查更新、下载替换与回退；网络与磁盘操作都在后台线程。"""
+
+    sig_checked = pyqtSignal(object)
+    sig_progress = pyqtSignal(str)
+    sig_applied = pyqtSignal(object)
+    sig_rolled = pyqtSignal(object)
+    sig_failed = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("检查更新")
+        self.setModal(False)
+        fit_screen(self, 640, 500, 520, 380)
+        self.info = None
+        self._busy = False
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(8)
+
+        self.lbl_title = QLabel("正在检查更新……")
+        self.lbl_title.setObjectName("section")
+        lay.addWidget(self.lbl_title)
+
+        self.lbl_meta = QLabel("按顺序探测镜像：单个源超时 4 秒自动换下一个")
+        self.lbl_meta.setObjectName("sub")
+        self.lbl_meta.setWordWrap(True)
+        lay.addWidget(self.lbl_meta)
+
+        lay.addWidget(QLabel("更新日志："))
+        self.txt_log = QPlainTextEdit()
+        self.txt_log.setObjectName("log")
+        self.txt_log.setReadOnly(True)
+        self.txt_log.setMinimumHeight(170)
+        lay.addWidget(self.txt_log, 1)
+
+        self.bar = QProgressBar()
+        self.bar.setTextVisible(False)
+        self.bar.setFixedHeight(8)
+        self.bar.setRange(0, 1)
+        self.bar.setValue(1)
+        lay.addWidget(self.bar)
+
+        self.lbl_status = QLabel("")
+        self.lbl_status.setObjectName("sub")
+        self.lbl_status.setWordWrap(True)
+        lay.addWidget(self.lbl_status)
+
+        foot = QHBoxLayout()
+        foot.addStretch(1)
+        self.btn_update = QPushButton("立即更新")
+        self.btn_update.setObjectName("primary")
+        self.btn_update.setMinimumHeight(34)
+        self.btn_update.clicked.connect(self.start_update)
+        self.btn_update.hide()
+        foot.addWidget(self.btn_update)
+
+        self.btn_restart = QPushButton("立即重启软件")
+        self.btn_restart.setMinimumHeight(34)
+        self.btn_restart.setToolTip("关掉当前进程并用同样的参数重新启动（更新要重启才生效）")
+        self.btn_restart.clicked.connect(self.restart_app)
+        self.btn_restart.hide()
+        foot.addWidget(self.btn_restart)
+
+        self.btn_rollback = QPushButton("回退上一版本")
+        self.btn_rollback.setMinimumHeight(34)
+        self.btn_rollback.setToolTip("用 logs\\backup_prev 里上一次更新的备份恢复旧文件")
+        self.btn_rollback.clicked.connect(self.rollback)
+        self.btn_rollback.hide()
+        foot.addWidget(self.btn_rollback)
+
+        self.btn_close = QPushButton("关闭")
+        self.btn_close.setMinimumHeight(34)
+        self.btn_close.clicked.connect(self.close)
+        foot.addWidget(self.btn_close)
+        lay.addLayout(foot)
+
+        self.sig_checked.connect(self._on_checked)
+        self.sig_progress.connect(self._on_progress)
+        self.sig_applied.connect(self._on_applied)
+        self.sig_rolled.connect(self._on_rolled)
+        self.sig_failed.connect(self._on_failed)
+
+    # ── 状态辅助 ─────────────────────────────────────────────────────────
+    def _append(self, msg):
+        self.txt_log.appendPlainText(str(msg))
+
+    def _set_busy(self, busy, text=""):
+        self._busy = busy
+        if busy:
+            self.bar.setRange(0, 0)
+        else:
+            self.bar.setRange(0, 1)
+        for btn in (self.btn_update, self.btn_restart, self.btn_rollback):
+            btn.setEnabled(not busy)
+        if text:
+            self.lbl_status.setText(text)
+
+    # ── 检查 ─────────────────────────────────────────────────────────────
+    def start_check(self):
+        if self._busy:
+            return
+        self.info = None
+        self.txt_log.clear()
+        self.lbl_title.setText("正在检查更新……")
+        self.lbl_meta.setText("按顺序探测镜像：单个源超时 4 秒自动换下一个")
+        self.btn_update.hide()
+        self.btn_restart.hide()
+        self.btn_rollback.setVisible(updater.has_backup())
+        self._set_busy(True, "正在连接镜像…")
+        threading.Thread(target=self._work_check, daemon=True).start()
+
+    def _work_check(self):
+        try:
+            info = updater.check_for_update(log=lambda m: self.sig_progress.emit(m))
+        except Exception as exc:  # noqa: BLE001
+            self.sig_failed.emit(str(exc))
+            return
+        self.sig_checked.emit(info)
+
+    def _on_progress(self, msg):
+        self._append(msg)
+
+    def _on_checked(self, info):
+        self.info = info
+        self._set_busy(False)
+        local_v = info.get("local_version") or "?"
+        remote_v = info.get("remote_version") or "?"
+        changes = info.get("changed") or []
+        logs = info.get("changelog") or []
+        self.lbl_meta.setText("本地版本 v%s　→　远端版本 v%s　｜　镜像：%s"
+                              % (local_v, remote_v, info.get("base") or "?"))
+        self.txt_log.clear()
+        if logs:
+            for line in logs:
+                self._append("· %s" % line)
+        else:
+            self._append("（远端没有提供更新日志）")
+
+        if info.get("status") == "latest":
+            self.lbl_title.setText("当前已是最新版本 (v%s)" % remote_v)
+            self.lbl_status.setText("共核对 %d 个文件，全部一致，无需更新。"
+                                    % int(info.get("same_count") or 0))
+            self.btn_update.hide()
+        else:
+            self.lbl_title.setText("发现新版本 v%s（%d 个文件需要更新）"
+                                   % (remote_v, len(changes)))
+            self._append("")
+            self._append("需要更新的文件：")
+            for rel in changes:
+                self._append("  - %s" % rel)
+            self.lbl_status.setText(
+                "更新前会自动备份到 logs\\backup_prev；下载后逐个核对 sha256 与语法，"
+                "任何一项不符就整批放弃，软件保持原样。")
+            self.btn_update.show()
+        self.btn_rollback.setVisible(updater.has_backup())
+
+    # ── 更新 ─────────────────────────────────────────────────────────────
+    def start_update(self):
+        if self._busy or not self.info:
+            return
+        if self.info.get("status") != "update":
+            return
+        if QMessageBox.question(
+                self, "确认更新",
+                "将更新 %d 个文件到 v%s。\n更新过程中请不要关闭软件。\n\n现在开始？"
+                % (len(self.info.get("changed") or []),
+                   self.info.get("remote_version") or "?")) != QMessageBox.Yes:
+            return
+        self.btn_update.hide()
+        self._set_busy(True, "正在下载并校验……")
+        self.lbl_title.setText("正在更新……")
+        threading.Thread(target=self._work_update, daemon=True).start()
+
+    def _work_update(self):
+        try:
+            staged = updater.download_update(
+                self.info,
+                log=lambda m: self.sig_progress.emit(m),
+                progress=lambda m: self.sig_progress.emit(m))
+            summary = updater.apply_update(
+                self.info, staged,
+                log=lambda m: self.sig_progress.emit(m),
+                progress=lambda m: self.sig_progress.emit(m))
+        except Exception as exc:  # noqa: BLE001
+            self.sig_failed.emit(str(exc))
+            return
+        self.sig_applied.emit(summary)
+
+    def _on_applied(self, summary):
+        self._set_busy(False)
+        self.lbl_title.setText("更新完成：v%s" % (summary.get("version") or "?"))
+        self.lbl_status.setText(
+            "已替换 %d 个文件，旧文件备份在 logs\\backup_prev。\n"
+            "点击「立即重启软件」后新代码才生效（软件不会自己热重载模块）。"
+            % int(summary.get("files") or 0))
+        self._append("")
+        self._append("更新完成，重启后生效。")
+        self.btn_update.hide()
+        self.btn_restart.show()
+        self.btn_rollback.setVisible(True)
+
+    # ── 回退 ─────────────────────────────────────────────────────────────
+    def rollback(self):
+        if self._busy:
+            return
+        if QMessageBox.question(
+                self, "回退上一版本",
+                "用 logs\\backup_prev 里的备份恢复上一次更新前的文件？\n"
+                "回退后同样需要重启软件。") != QMessageBox.Yes:
+            return
+        self._set_busy(True, "正在回退……")
+        self.lbl_title.setText("正在回退……")
+        threading.Thread(target=self._work_rollback, daemon=True).start()
+
+    def _work_rollback(self):
+        try:
+            summary = updater.rollback_update(log=lambda m: self.sig_progress.emit(m))
+        except Exception as exc:  # noqa: BLE001
+            self.sig_failed.emit(str(exc))
+            return
+        self.sig_rolled.emit(summary)
+
+    def _on_rolled(self, summary):
+        self._set_busy(False)
+        self.lbl_title.setText("已回退上一版本")
+        msg = "已恢复 %d 个文件（删除新增 %d 个）" % (
+            int(summary.get("restored") or 0), int(summary.get("deleted") or 0))
+        if summary.get("missing"):
+            msg += "\n以下文件备份缺失：%s" % "、".join(summary["missing"])
+        msg += "\n点击「立即重启软件」后生效。"
+        self.lbl_status.setText(msg)
+        self._append("")
+        self._append(msg.replace("\n", " "))
+        self.btn_update.hide()
+        self.btn_restart.show()
+
+    def _on_failed(self, msg):
+        self._set_busy(False)
+        self.lbl_title.setText("操作失败（软件保持原样）")
+        self.lbl_status.setText(msg)
+        self._append("")
+        self._append("× %s" % msg)
+        if self.info and self.info.get("status") == "update":
+            self.btn_update.show()
+        self.btn_rollback.setVisible(updater.has_backup())
+
+    # ── 重启 ─────────────────────────────────────────────────────────────
+    def restart_app(self):
+        try:
+            exe, args = updater.restart_argv()
+            ok = QProcess.startDetached(exe, args, str(ROOT))
+        except Exception as exc:  # noqa: BLE001
+            ok = False
+            self._append("× 重启失败：%s" % exc)
+        if not ok:
+            QMessageBox.warning(self, "重启失败", "自动重启没成功，请手动关掉软件再双击启动。")
+            return
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+
 class UnifiedWindow(QMainWindow):
     sig_external = pyqtSignal(str, object)
 
@@ -556,25 +835,39 @@ class UnifiedWindow(QMainWindow):
         lay.setSpacing(6)
 
         top = QHBoxLayout()
+        top.setSpacing(8)
         title = QLabel("异键演奏")
         title.setObjectName("appTitle")
         top.addWidget(title)
+        top.addSpacing(6)
         self.lbl_ai = QLabel("AI 加速：检测中…")
         self.lbl_game = QLabel("游戏窗口：检测中…")
         self.lbl_admin = QLabel("管理员：检测中…")
+        pill_css = ("padding: 3px 9px; border-radius: 6px; font-size: 12px; "
+                    "background: rgba(148, 163, 184, 0.12);")
         for w in (self.lbl_ai, self.lbl_game, self.lbl_admin):
+            w.setStyleSheet(pill_css)
             top.addWidget(w)
         top.addStretch(1)
+        self.lbl_hotkey = QLabel("[F8] 开始/暂停  [F12] 紧急停止")
+        self.lbl_hotkey.setObjectName("sub")
+        top.addWidget(self.lbl_hotkey)
+        top.addSpacing(4)
         self.theme_mode = GT.load_mode() or "dark"
         self._env_dialog = None
         self.btn_env_check = QPushButton("环境与显卡体检")
         self.btn_env_check.clicked.connect(self.show_env_check)
         top.addWidget(self.btn_env_check)
+        self._update_dlg = None
+        self.btn_update_check = QPushButton("检查更新")
+        self.btn_update_check.setToolTip(
+            "联网检查 GitHub 上的新版本（多镜像探测 + 哈希/语法校验 + 自动备份与回退）")
+        self.btn_update_check.clicked.connect(self.open_update_dialog)
+        top.addWidget(self.btn_update_check)
         self.btn_theme = QPushButton()
         self.btn_theme.clicked.connect(self.toggle_theme)
         top.addWidget(self.btn_theme)
         self._sync_theme_button()
-        top.addWidget(QLabel("[F8] 开始/暂停  [F12] 紧急停止"))
         lay.addLayout(top)
 
         self.tabs = QTabWidget()
@@ -653,11 +946,28 @@ class UnifiedWindow(QMainWindow):
             dlg.start_check()
         return dlg
 
+    def open_update_dialog(self):
+        """顶部状态栏「检查更新」：每次点都重新探测远端。"""
+        dlg = getattr(self, "_update_dlg", None)
+        if dlg is None:
+            dlg = UpdateDialog(self)
+            self._update_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        dlg.start_check()
+        return dlg
+
     def _on_a_all_done(self, path):
         try:
             if self.a.chk_auto_send.isChecked():
                 self.send_to_player(path)
                 self.tabs.setCurrentIndex(1)
+        except Exception:
+            pass
+        # v1.2：扒谱完成后刷新演奏页左侧「本地 MIDI 曲库」
+        try:
+            self.b.refresh_midi_list()
         except Exception:
             pass
 
@@ -666,7 +976,10 @@ class UnifiedWindow(QMainWindow):
             dev = self.a.device_state.text()
         except Exception:
             dev = "未知"
-        self.lbl_ai.setText("AI 加速：%s" % dev)
+        short_dev = (dev.replace("当前可用：", "")
+                        .replace("（点右上角「环境与显卡体检」一键安装）", ""))
+        self.lbl_ai.setText("AI 加速：%s" % short_dev)
+        self.lbl_ai.setToolTip(dev)
         try:
             m = self.b.io.metrics()
         except Exception:
@@ -679,7 +992,8 @@ class UnifiedWindow(QMainWindow):
             adm = ctypes.windll.shell32.IsUserAnAdmin() != 0
         except Exception:
             adm = False
-        self.lbl_admin.setText("管理员：%s" % ("有" if adm else "没有（按键送不进游戏）"))
+        self.lbl_admin.setText("管理员：%s" % ("有" if adm else "无"))
+        self.lbl_admin.setToolTip("没有管理员权限时按键送不进游戏；请用启动器重新打开")
 
     def _apply_external(self, path, compiled):
         """主线程里刷新演奏页（后台线程只 emit，不碰控件）。"""

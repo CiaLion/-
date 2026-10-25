@@ -283,12 +283,12 @@ def _slice_grid(s, nxt, T):
         nstart = float(nxt["t"])
         if 0 < nstart - start <= 4.5 and nstart - end <= T:
             D = nstart - start
-    N = max(1, int(round(D / T)))
-    b = D / float(N)
+    b = float(T or 0.50)
     if b < 0.30:
         b *= 2.0
     elif b > 0.85:
         b /= 2.0
+    N = max(1, int(round(D / b)))
     return D, N, b
 
 
@@ -354,13 +354,6 @@ def build_p2(flat_notes, chord_idx, bpm=None, enable_arpeggio=True, arpeggio_pat
             tail_cap = min(tail_cap, float(sl["end"]) - P2_SWITCH_RESERVE)
         limit = tail_cap - max(0.06, timing.advance_need(0, False, True))
         arp_step = beat / 2.0 if (beat / 2.0) >= 0.16 else beat
-        span_avail = float(limit) - t0
-        n_pcs = len({p % 12 for p in cycle})
-        floor_step = max(0.16, timing.advance_need(0, False, True) + timing.p4)
-        if n_pcs > 1 and span_avail > 0:
-            need_step = span_avail / float(n_pcs - 1)
-            if need_step < arp_step:
-                arp_step = max(floor_step, need_step)
         seq, k, tt = [], 0, t0
         while tt <= limit + 1e-9 and k < 32:
             seq.append((tt, cycle[k % len(cycle)]))

@@ -50,8 +50,9 @@ from PyQt5.QtGui import (QColor, QFont, QKeySequence, QPainter,  # noqa: E402
                          QPen, QPolygon)
 from PyQt5.QtWidgets import (QAbstractScrollArea, QApplication, QCheckBox,  # noqa: E402
                              QComboBox, QDialog, QFileDialog, QHBoxLayout,
-                             QLabel, QMessageBox, QPushButton, QShortcut,
-                             QSizePolicy, QSlider, QVBoxLayout)
+                             QFrame, QLabel, QMessageBox, QPushButton,
+                             QScrollArea, QShortcut, QSizePolicy, QSlider,
+                             QVBoxLayout, QWidget)
 
 import midi_compiler as MC  # noqa: E402
 import guitar_plan as GP  # noqa: E402
@@ -472,7 +473,7 @@ class PianoRollModel(object):
         return None
 
     def save_guard(self):
-        """保存/应用前的硬拦截判定（不弹窗，供门禁与对话框共用）。"""
+        """保存/应用前的硬拦截判定（不弹窗）。"""
         if self.mode == "role":
             try:
                 self.compile()
@@ -1606,6 +1607,8 @@ class PianoRollDialog(QDialog):
         avail = QApplication.desktop().availableGeometry(self)
         self.resize(min(1280, int(avail.width() * 0.94)),
                     min(760, int(avail.height() * 0.88)))
+        self.setMinimumSize(min(860, int(avail.width() * 0.70)),
+                            min(520, int(avail.height() * 0.60)))
         self.on_apply = on_apply
         self._wav = None
         self._wav_path = None
@@ -1646,10 +1649,25 @@ class PianoRollDialog(QDialog):
             from PyQt5.QtMultimedia import QMediaContent, QMediaPlayer
             self._QMediaContent = QMediaContent
             self.player = QMediaPlayer(self)
-            self.player.setVolume(85)
+            vol = int(PC.load().get("roll_volume", 35))
+            self.player.setVolume(max(0, min(100, vol)))
             self.player.mediaStatusChanged.connect(self._on_media_status)
         except Exception:
             self.player = None
+            
+    def _on_volume_changed(self, val):
+        v = max(0, min(100, int(val)))
+        if hasattr(self, "lbl_vol"):
+            self.lbl_vol.setText("%d%%" % v)
+        if self.player is not None:
+            try:
+                self.player.setVolume(v)
+            except Exception:
+                pass
+        try:
+            PC.save({"roll_volume": v})
+        except Exception:
+            pass
 
     # ── UI ─────────────────────────────────────────────────────────────
     def _btn(self, text, tip, slot, obj=None):
@@ -1688,17 +1706,34 @@ class PianoRollDialog(QDialog):
                                    self.apply_custom, obj="primary")
         for b in (self.btn_fix, self.cmb_inst, self.btn_restore, self.btn_apply):
             row.addWidget(b)
-        root.addLayout(row)
+
+        tb_widget = QWidget()
+        tb_lay = QVBoxLayout(tb_widget)
+        tb_lay.setContentsMargins(0, 0, 0, 0)
+        tb_lay.setSpacing(6)
+        tb_lay.addLayout(row)
 
         row2 = QHBoxLayout()
         self.btn_play = self._btn("▶ 试听", "空格：播放/暂停；也可用底部滑块或顶部节拍表拖动", self.preview)
         self.btn_stop = self._btn("⏹ 停止", "停止试听", self.stop_preview)
         row2.addWidget(self.btn_play)
         row2.addWidget(self.btn_stop)
+        row2.addWidget(QLabel("音量:"))
+        self.sld_vol = QSlider(Qt.Horizontal)
+        self.sld_vol.setRange(0, 100)
+        _init_vol = int(PC.load().get("roll_volume", 35))
+        self.sld_vol.setValue(max(0, min(100, _init_vol)))
+        self.sld_vol.setFixedWidth(80)
+        self.sld_vol.setToolTip("调节试听音量")
+        self.lbl_vol = QLabel("%d%%" % self.sld_vol.value())
+        self.lbl_vol.setMinimumWidth(34)
+        self.sld_vol.valueChanged.connect(self._on_volume_changed)
+        row2.addWidget(self.sld_vol)
+        row2.addWidget(self.lbl_vol)
         self.lbl_mode = QLabel("")
         row2.addWidget(self.lbl_mode)
         self.cmb_track = QComboBox()
-        self.cmb_track.setMinimumWidth(265)
+        self.cmb_track.setMinimumWidth(200)
         self.cmb_track.currentIndexChanged.connect(self._switch_track)
         self.lbl_track = QLabel("轨道：")
         row2.addWidget(self.lbl_track)
@@ -1729,7 +1764,7 @@ class PianoRollDialog(QDialog):
         self.chk_phys_preview.toggled.connect(self._toggle_phys_preview)
         row2.addWidget(self.chk_phys_preview)
         row2.addStretch(1)
-        root.addLayout(row2)
+        tb_lay.addLayout(row2)
 
         row_chord = QHBoxLayout()
         self.lbl_chord = QLabel("当前和弦：")
@@ -1749,7 +1784,17 @@ class PianoRollDialog(QDialog):
                   self.btn_strum_u, self.btn_strum_d, self.cmb_string, self.btn_pluck):
             row_chord.addWidget(w)
         row_chord.addStretch(1)
-        root.addLayout(row_chord)
+        tb_lay.addLayout(row_chord)
+
+        tb_scroll = QScrollArea()
+        tb_scroll.setFrameShape(QFrame.NoFrame)
+        tb_scroll.setWidgetResizable(True)
+        tb_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        tb_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        tb_scroll.setWidget(tb_widget)
+        tb_scroll.setMinimumWidth(360)
+        tb_scroll.setFixedHeight(tb_widget.sizeHint().height() + 18)
+        root.addWidget(tb_scroll)
 
         root.addWidget(self.canvas, 1)
         self.canvas.setToolTip(
@@ -1774,11 +1819,14 @@ class PianoRollDialog(QDialog):
         status_row = QHBoxLayout()
         self.lbl_status = QLabel("")
         self.lbl_status.setObjectName("sub")
+        self.lbl_status.setWordWrap(True)
+        self.lbl_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         status_row.addWidget(self.lbl_status, 1)
         self.lbl_legend = QLabel("")
         self.lbl_legend.setObjectName("sub")
         self.lbl_legend.setTextFormat(Qt.RichText)
         self.lbl_legend.setWordWrap(False)
+        self.lbl_legend.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         status_row.addWidget(self.lbl_legend, 0)
         root.addLayout(status_row)
 
@@ -2128,6 +2176,12 @@ class PianoRollDialog(QDialog):
         if self.parent() is not None and hasattr(self.parent(), "_append_log"):
             try:
                 self.parent()._append_log(msg.replace("\n", " ｜ "))
+            except Exception:
+                pass
+        # v1.2：另存到 out/ 之后，让演奏页左侧「本地 MIDI 曲库」自动刷新
+        if self.parent() is not None and hasattr(self.parent(), "refresh_midi_list"):
+            try:
+                self.parent().refresh_midi_list()
             except Exception:
                 pass
 

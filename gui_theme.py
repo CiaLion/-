@@ -147,6 +147,11 @@ def build_stylesheet(mode="dark"):
         font-weight: 700; }}
     QPushButton#ghost {{ background: {ghost_bg}; color: {ghost_text}; }}
     QPushButton#danger {{ color: {danger}; border-color: {danger_line}; }}
+    QPushButton#presetBtn {{
+        min-height: 52px; text-align: left; padding: 6px 14px;
+        font-size: 13px; font-weight: 600; }}
+    QPushButton#presetBtn:checked {{
+        background: {blue}; border: 2px solid {blue}; color: #FFFFFF; }}
 
     QCheckBox, QRadioButton {{
         background: transparent; color: {text}; spacing: 8px;

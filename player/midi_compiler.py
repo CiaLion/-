@@ -118,22 +118,18 @@ class Timing(object):
         return max(self.p20, 0.005)
 
     def switch_span(self, steps, cross_page=False, need_click=True):
-        """上一个音拨响 → 下一个音准时响，需要预留的真实时长（对齐 preschedule）。"""
+        """上一个音拨响 → 下一个音准时响，需要预留的真实时长。"""
         steps = int(steps or 0)
+        press_delay = max(0.001, self.p1)
         if steps <= 0:
-            span = self.p1 + self.p17
-            if need_click:
-                span += self.p1 + self.p2
+            # 同页换扇区：按下左键 1ms 后即可按弦；若连续换扇区则受上一次左键按住时长约束
+            span = (self.p2 + press_delay + self.p17) if need_click else press_delay
             return round(span, 6)
         if steps == 1:
-            span = self.p12 + self.p14 + self.p16
-            if need_click:
-                span += self.p2 + self.p18
+            span = self.p12 + self.p14 + self.p16 + self.p18
             return round(span, 6)
         span = (steps * self.p12 + (steps - 1) * self.p13
-                + self.p14 + self.p16)
-        if need_click:
-            span += self.p2 + self.p18
+                + self.p14 + self.p16 + self.p18)
         return round(span, 6)
 
     def advance_need(self, steps, cross_page=False, need_click=True):
@@ -933,17 +929,15 @@ def preschedule(events, kind, timing=None, start_page=1, log=None, detail=False)
                 pg_events.append((t_up_last, "key_up", {"key": key}))
                 turns += steps
 
-            # ② 点扇区（按下判定，仅在需要点扇区且扇区号真变了时才点）
+            # ② 点扇区（按下即触发：在拨弦前 1ms 按下左键即可立刻按弦，按住满帧时长+1ms后松开）
             if need_sector and sec != cur_sec:
                 hold_click = t.click_hold(cur_kind)
-                if steps > 0:
-                    t_click = t_up_last - t.p18 - hold_click
-                else:
-                    t_click = t_ready - t.p1 - t.p17 - hold_click - click_gap
-                wheel_events.append((t_click - t.p1, "move_sector",
+                press_delay = max(0.001, t.p1)
+                t_click = t_ready - press_delay - t.p17 - click_gap
+                wheel_events.append((t_click - 0.001, "move_sector",
                                      {"page": page, "sector": sec}))
                 wheel_events.append((t_click, "mouse_down", {"btn": "left"}))
-                wheel_events.append((t_click + t.click_hold(cur_kind), "mouse_up", {"btn": "left"}))
+                wheel_events.append((t_click + hold_click, "mouse_up", {"btn": "left"}))
                 clicks += 1
             # 关键修复：访问第 5 页（PAGE_ZERO，need_sector=False）时未点选扇区，
             # 游戏内高亮扇区保持原样，因此仅在 need_sector 为真时更新 cur_sec！
@@ -990,7 +984,8 @@ def preschedule(events, kind, timing=None, start_page=1, log=None, detail=False)
             chain.sort(key=lambda x: x[0])
             for (ct, op, kw) in chain:
                 hw.append(_hw(ct, op, **kw))
-                prev_action = max(prev_action or ct, ct)
+                if op != "mouse_up":
+                    prev_action = max(prev_action or ct, ct)
                 if op.startswith("key_"):
                     prev_kbd = max(prev_kbd or ct, ct)
                 elif op.startswith("mouse_"):
@@ -1086,7 +1081,7 @@ def _interlock(hw, t):
     holds = []
     down = None
     for e in sorted(hw, key=lambda x: x["t"]):
-        if e["op"] == "mouse_down":
+        if e["op"] == "mouse_down" and e.get("sound"):
             down = e
         elif e["op"] == "mouse_up" and down:
             holds.append([down["t"], e["t"], down["btn"], e])

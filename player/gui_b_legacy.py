@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
-"""gui_b_legacy.py -- 《异键演奏》v1.1 演奏台界面（MIDI 编译器 + 高精度播放器）。
+"""gui_b_legacy.py -- 《异键演奏》v1.2 演奏台界面（MIDI 编译器 + 高精度播放器）。
 
 界面功能：
-  ① 选歌         选一份 .mid（测试曲默认从项目里的 assets/test_midis 取）
+  ① 左侧曲库     本地 MIDI 曲库列表：刷新 / 导入 / 搜索，点一下即加载并编译
   ② 选角色       1P 单人独奏 / 1P 主音 / 2P 伴奏（琶音·根音）/ 2P 伴奏（柱式·扫弦）
   ③ 照着摆游戏   大字提示"按 Z 切到哪个模式、按 T/R 翻到第几页"
   ④ 开始演奏     F8 开始/暂停、F12 紧急停止；支持整 5 秒双人同步启动與系统声音内录
-  ⑤ 时序预设     主界面直出 30帧(默认)/60帧/90帧 三档预设，独立弹窗支持 18 项参数自由微调
+  ⑤ 时序预设     主界面直出 30帧(默认)/60帧/90帧 三档预设，独立弹窗支持 6 项核心参数微调
 """
 import os
+import shutil
 import sys
 import threading
 import time
@@ -19,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(BASE_DIR)
 TEST_MIDI_DIR = os.path.join(PROJECT_DIR, "assets", "test_midis")
+OUT_DIR = os.path.join(PROJECT_DIR, "out")
 
 for _cand_plug in (
     os.path.join(PROJECT_DIR, ".venv", "Lib", "site-packages", "PyQt5", "Qt5", "plugins"),
@@ -32,9 +34,10 @@ from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
                              QDialog, QDoubleSpinBox, QFileDialog, QFrame,
                              QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+                             QLineEdit, QListWidget, QListWidgetItem,
                              QMainWindow, QMessageBox, QPlainTextEdit,
-                             QProgressBar, QPushButton, QRadioButton, QScrollArea,
-                             QVBoxLayout, QWidget)
+                             QProgressBar, QPushButton, QRadioButton,
+                             QScrollArea, QVBoxLayout, QWidget)
 
 import input_engine as ie
 import midi_compiler as MC
@@ -51,6 +54,20 @@ ROLE_TITLE = {
     MC.ROLE_DUET_RHYTHM_FRET: "双人合奏 · 2P 伴奏（琶音/根音）",
     MC.ROLE_DUET_RHYTHM: "双人合奏 · 2P 伴奏（柱式/扫弦）",
 }
+def _fit_screen(widget, width, height, min_w=560, min_h=420):
+    try:
+        avail = QApplication.desktop().availableGeometry(widget)
+        width = min(int(width), int(avail.width() * 0.94))
+        height = min(int(height), int(avail.height() * 0.90))
+        min_w = min(int(min_w), int(avail.width() * 0.70))
+        min_h = min(int(min_h), int(avail.height() * 0.65))
+    except Exception:
+        pass
+    widget.resize(max(min_w, width), max(min_h, height))
+    widget.setMinimumSize(min_w, min_h)
+    return widget
+
+
 ROLE_TIP = {
     MC.ROLE_SOLO: "主旋律 + 同把位双音与颗粒琶音智能合流",
     MC.ROLE_DUET_LEAD: "纯品格模式：主旋律与间奏 Solo",
@@ -81,6 +98,14 @@ def _timing_dep_text(key):
         "start_delay": "只加在时间轴开头",
         "preschedule_lead": "额外提前量",
     }.get(key, "直接生效")
+
+
+def _same_path(a, b):
+    """两个路径是否指向同一个文件（大小写不敏感的简化判断）。"""
+    try:
+        return (os.path.abspath(str(a)).lower() == os.path.abspath(str(b)).lower())
+    except Exception:
+        return False
 
 
 class CompileWorker(threading.Thread):
@@ -217,7 +242,7 @@ class PlayWorker(threading.Thread):
 
 
 class TimingConfigDialog(QDialog):
-    """18 项底层时间参数的独立配置弹窗（920×680）。"""
+    """6 项核心时间参数的独立配置弹窗（920×680）。"""
 
     def __init__(self, owner, parent=None):
         super(TimingConfigDialog, self).__init__(parent or owner)
@@ -225,26 +250,11 @@ class TimingConfigDialog(QDialog):
         self.setObjectName("timingDialog")
         self.setWindowTitle("高级时间参数配置")
         self.setModal(False)
-        self.resize(920, 680)
-        self.setMinimumSize(820, 560)
+        _fit_screen(self, 920, 680, 560, 420)
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(14, 12, 14, 12)
         lay.setSpacing(8)
-
-        preset_row = QHBoxLayout()
-        preset_row.setSpacing(8)
-        for key, text, tip in (
-                ("30fps", "30 帧预设（默认）", "单帧 33.3ms，防低帧率吞键/吞翻页"),
-                ("60fps", "60 帧预设", "单帧 16.7ms，均衡档"),
-                ("90fps", "90 帧预设", "单帧 11.1ms，适合高刷机器")):
-            btn = QPushButton(text)
-            btn.setToolTip(tip)
-            btn.setMinimumHeight(34)
-            btn.clicked.connect(lambda _=False, k=key: owner.apply_timing_preset(k))
-            preset_row.addWidget(btn)
-        preset_row.addStretch(1)
-        lay.addLayout(preset_row)
 
         self.adv_box = owner.adv_box
         lay.addWidget(self.adv_box, 1)
@@ -280,8 +290,8 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super(MainWindow, self).__init__()
-        self.setWindowTitle("《异键演奏》v1.1")
-        self.resize(960, 780)
+        self.setWindowTitle("《异键演奏》v1.2")
+        _fit_screen(self, 960, 780, 660, 520)
         self.setAcceptDrops(True)
         self.timelines = {}
         self.path = None
@@ -304,13 +314,194 @@ class MainWindow(QMainWindow):
         self._update_switch_hints(self.role)
         self._hotkeys()
 
+    # out/ 中的中间过程文件不列入曲库
+    MIDI_INTERMEDIATE_STEMS = ("main_melody", "chords", "chords_merged",
+                               "melody_vocal", "melody_instrumental",
+                               "transcription")
+
+    def _build_midi_library(self):
+        """左侧卡片：标题行（刷新 / 导入）+ 搜索框 + 曲目列表。"""
+        box = QFrame()
+        box.setObjectName("card")
+        try:
+            _sw = QApplication.desktop().availableGeometry(self).width()
+        except Exception:
+            _sw = 1280
+        box.setFixedWidth(max(215, min(265, int(_sw * 0.20))))
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setSpacing(5)
+        title = QLabel("本地 MIDI 曲库")
+        title.setObjectName("section")
+        head.addWidget(title, 1)
+        mini_btn_css = "padding: 2px 10px; min-height: 28px; font-size: 12px;"
+        self.btn_midi_refresh = QPushButton("刷新")
+        self.btn_midi_refresh.setStyleSheet(mini_btn_css)
+        self.btn_midi_refresh.setToolTip("重新扫描内置测试曲与 out/ 目录")
+        self.btn_midi_refresh.clicked.connect(self.refresh_midi_list)
+        head.addWidget(self.btn_midi_refresh)
+        self.btn_midi_import = QPushButton("+ 导入")
+        self.btn_midi_import.setStyleSheet(mini_btn_css)
+        self.btn_midi_import.setToolTip(
+            "从电脑任意位置选 .mid / .midi，自动复制到项目 out/ 目录归档")
+        self.btn_midi_import.clicked.connect(self.import_midi_files)
+        head.addWidget(self.btn_midi_import)
+        lay.addLayout(head)
+
+        self.edit_midi_search = QLineEdit()
+        self.edit_midi_search.setPlaceholderText("搜索曲名…")
+        self.edit_midi_search.setClearButtonEnabled(True)
+        self.edit_midi_search.textChanged.connect(self._filter_midi_list)
+        lay.addWidget(self.edit_midi_search)
+
+        self.midi_list = QListWidget()
+        self.midi_list.setObjectName("midiList")
+        self.midi_list.setAlternatingRowColors(True)
+        self.midi_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.midi_list.setTextElideMode(Qt.ElideRight)
+        self.midi_list.setMinimumWidth(0)
+        self.midi_list.itemClicked.connect(self._on_midi_item_clicked)
+        self.midi_list.itemDoubleClicked.connect(self._on_midi_item_clicked)
+        lay.addWidget(self.midi_list, 1)
+
+        self.lbl_midi_count = QLabel("（正在扫描…）")
+        self.lbl_midi_count.setObjectName("sub")
+        lay.addWidget(self.lbl_midi_count)
+        return box
+
+    def _midi_library_items(self):
+        """曲库内容：内置测试曲置顶，其后是 out/ 里的成品 MIDI。"""
+        items = []
+        demo = os.path.join(TEST_MIDI_DIR, "sample_demo.mid")
+        if os.path.isfile(demo):
+            items.append(("[内置测试] sample_demo", demo))
+        try:
+            names = sorted(os.listdir(OUT_DIR), key=lambda s: s.lower())
+        except Exception:
+            names = []
+        for name in names:
+            low = name.lower()
+            if not low.endswith((".mid", ".midi")):
+                continue
+            if os.path.splitext(low)[0] in self.MIDI_INTERMEDIATE_STEMS:
+                continue
+            path = os.path.join(OUT_DIR, name)
+            if os.path.isfile(path):
+                items.append((name, path))
+        return items
+
+    def refresh_midi_list(self):
+        """重扫曲库（扒谱完成、卷帘另存、导入后都会自动调用）。"""
+        if not hasattr(self, "midi_list"):
+            return
+        keep = getattr(self, "_midi_selected_path", None) or self.path
+        try:
+            self.midi_list.clear()
+            count = 0
+            for label, path in self._midi_library_items():
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, path)
+                item.setToolTip(path)
+                self.midi_list.addItem(item)
+                count += 1
+                if keep and os.path.abspath(path) == os.path.abspath(str(keep)):
+                    self.midi_list.setCurrentItem(item)
+            self._filter_midi_list()
+            self.lbl_midi_count.setText("共 %d 首（点一下即加载）" % count)
+        except Exception as exc:
+            self._append_log("× 曲库刷新失败：%s" % exc)
+
+    def _filter_midi_list(self, _text=None):
+        """按搜索框实时过滤（隐藏不匹配的行）。"""
+        if not hasattr(self, "midi_list"):
+            return
+        key = (self.edit_midi_search.text() if hasattr(self, "edit_midi_search") else "")
+        key = str(key or "").strip().lower()
+        shown = 0
+        for i in range(self.midi_list.count()):
+            item = self.midi_list.item(i)
+            hit = (not key) or (key in item.text().lower())
+            item.setHidden(not hit)
+            if hit:
+                shown += 1
+        if hasattr(self, "lbl_midi_count"):
+            if key:
+                self.lbl_midi_count.setText("匹配 %d 首（点一下即加载）" % shown)
+            else:
+                self.lbl_midi_count.setText(
+                    "共 %d 首（点一下即加载）" % self.midi_list.count())
+
+    def _on_midi_item_clicked(self, item):
+        """点列表里的曲目 → 立即加载并编译。"""
+        try:
+            path = item.data(Qt.UserRole)
+        except Exception:
+            path = None
+        if not path or not os.path.isfile(path):
+            return
+        if self.path and os.path.abspath(path) == os.path.abspath(str(self.path)):
+            return
+        self._midi_selected_path = path
+        self.load(path)
+
+    def import_midi_files(self):
+        """把电脑任意位置的 MIDI 复制进 out/ 归档，然后刷新曲库。"""
+        dlg = QFileDialog(self, "导入 MIDI 到曲库", "", "MIDI 文件 (*.mid *.midi)")
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        dlg.setFileMode(QFileDialog.ExistingFiles)
+        if not dlg.exec_():
+            return 0
+        return self.archive_midi_files(dlg.selectedFiles() or [])
+
+    def archive_midi_files(self, files):
+        """把给定路径的 MIDI 归档进 out/（重名自动加序号），返回成功数量。"""
+        try:
+            os.makedirs(OUT_DIR, exist_ok=True)
+        except Exception as exc:
+            self._append_log("× 创建 out 目录失败：%s" % exc)
+            return 0
+        added = 0
+        last_dst = None
+        for src in (files or []):
+            try:
+                base = os.path.basename(str(src))
+                stem, ext = os.path.splitext(base)
+                dst = os.path.join(OUT_DIR, base)
+                n = 2
+                while os.path.exists(dst) and not _same_path(dst, src):
+                    dst = os.path.join(OUT_DIR, "%s (%d)%s" % (stem, n, ext))
+                    n += 1
+                if not _same_path(dst, src):
+                    shutil.copy2(src, dst)
+                last_dst = dst
+                added += 1
+                self._append_log("＋ 已归档到 out/%s" % os.path.basename(dst))
+            except Exception as exc:
+                self._append_log("× 导入失败（%s）：%s" % (src, exc))
+        self.refresh_midi_list()
+        if added:
+            self._append_log("曲库已刷新：新导入 %d 首" % added)
+            self.load(last_dst)
+        return added
+
     def _build_ui(self):
-        """三卡片控制台（曲目/角色 → 准备+主控 → 录音/预设/参数/日志）。"""
+        """左侧本地 MIDI 曲库 + 右侧操控台（曲目/角色 → 准备+主控 → 录音/预设/参数/日志）。"""
         root = QWidget()
         self.setCentralWidget(root)
-        v = QVBoxLayout(root)
-        v.setContentsMargins(12, 10, 12, 10)
+        outer = QHBoxLayout(root)
+        outer.setContentsMargins(12, 10, 12, 10)
+        outer.setSpacing(10)
+
+        outer.addWidget(self._build_midi_library())
+
+        right = QWidget()
+        v = QVBoxLayout(right)
+        v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(8)
+        outer.addWidget(right, 1)
 
         # 卡片 1：曲目加载与四角色编配
         c1 = QFrame()
@@ -319,25 +510,31 @@ class MainWindow(QMainWindow):
         a.setContentsMargins(12, 10, 12, 10)
         a.setSpacing(6)
         row = QHBoxLayout()
-        self.btn_open = QPushButton("打开 MIDI 乐谱…")
-        self.btn_open.clicked.connect(self.open_file)
-        row.addWidget(self.btn_open)
-        self.btn_testmidi = QPushButton("选择测试 MIDI")
-        self.btn_testmidi.setToolTip("默认列出项目里的 assets/test_midis 文件夹")
+        self.btn_testmidi = QPushButton("载入内置测试曲")
+        self.btn_testmidi.setToolTip("直接加载 assets/test_midis/sample_demo.mid")
         self.btn_testmidi.clicked.connect(self.open_test_midi)
         row.addWidget(self.btn_testmidi)
         self.lbl_file = QLabel("（还没选歌）")
         self.lbl_file.setObjectName("sub")
         row.addWidget(self.lbl_file, 1)
-        self.btn_preview_role = QPushButton("♪ 试听当前角色")
-        self.btn_preview_role.setToolTip("无需打开游戏或卷帘，直接合成试听当前选中角色的编配效果（再点停止）")
-        self.btn_preview_role.clicked.connect(self.toggle_role_preview)
-        row.addWidget(self.btn_preview_role)
         self.btn_roll = QPushButton("打开钢琴卷帘微调")
         self.btn_roll.setToolTip("打开当前角色的转译序列；改完可直接重编并更新演奏台")
         self.btn_roll.clicked.connect(self.open_piano_roll)
         row.addWidget(self.btn_roll)
         a.addLayout(row)
+
+        self.chk_arpeggio = QCheckBox("开启和弦内音琶音")
+        self.chk_arpeggio.setChecked(bool(PC.load().get("enable_arpeggio", True)))
+        self.chk_arpeggio.toggled.connect(self._on_arpeggio_toggled)
+        self.chk_chord_rhythm = QCheckBox("开启和弦扫弦律动")
+        self.chk_chord_rhythm.setChecked(bool(PC.load().get("enable_chord_rhythm", True)))
+        self.chk_chord_rhythm.toggled.connect(self._on_chord_rhythm_toggled)
+        self.chk_strum_mode = QCheckBox("柱式改用鼠标扫弦")
+        self.chk_strum_mode.setChecked(bool(PC.load().get("chord_strum_mode", False)))
+        self.chk_strum_mode.toggled.connect(self._on_strum_mode_toggled)
+        self.cmb_pattern = QComboBox()
+        self.cmb_pattern.addItem("固定从低到高", "ascending")
+        self.cmb_pattern.setVisible(False)
 
         self.radios = {}
         self.role_group = QButtonGroup(self)
@@ -359,32 +556,30 @@ class MainWindow(QMainWindow):
             desc = QLabel(ROLE_TIP[r])
             desc.setObjectName("roleDesc")
             desc.setContentsMargins(24, 0, 0, 0)
+            desc.setWordWrap(True)
             desc.setCursor(Qt.PointingHandCursor)
             desc.mousePressEvent = lambda _ev, box=rb: box.setChecked(True)
             cv.addWidget(desc)
+            if r == MC.ROLE_DUET_RHYTHM_FRET:
+                row_opt = QHBoxLayout()
+                row_opt.setContentsMargins(24, 2, 0, 0)
+                row_opt.addWidget(self.chk_arpeggio)
+                row_opt.addStretch(1)
+                cv.addLayout(row_opt)
+            elif r == MC.ROLE_DUET_RHYTHM:
+                row_opt = QHBoxLayout()
+                row_opt.setContentsMargins(24, 2, 0, 0)
+                row_opt.setSpacing(14)
+                row_opt.addWidget(self.chk_chord_rhythm)
+                row_opt.addWidget(self.chk_strum_mode)
+                row_opt.addStretch(1)
+                cv.addLayout(row_opt)
+                cv.addWidget(self.cmb_pattern)
+            cv.addStretch(1)
             grid.addWidget(cell, i // 2, i % 2)
             self.radios[r] = rb
         a.addLayout(grid)
 
-        row_arp = QHBoxLayout()
-        self.chk_arpeggio = QCheckBox("开启和弦内音琶音")
-        self.chk_arpeggio.setChecked(bool(PC.load().get("enable_arpeggio", True)))
-        self.chk_arpeggio.toggled.connect(self._on_arpeggio_toggled)
-        row_arp.addWidget(self.chk_arpeggio)
-        self.chk_chord_rhythm = QCheckBox("开启和弦扫弦律动")
-        self.chk_chord_rhythm.setChecked(bool(PC.load().get("enable_chord_rhythm", True)))
-        self.chk_chord_rhythm.toggled.connect(self._on_chord_rhythm_toggled)
-        row_arp.addWidget(self.chk_chord_rhythm)
-        self.chk_strum_mode = QCheckBox("2P柱式改用鼠标扫弦")
-        self.chk_strum_mode.setChecked(bool(PC.load().get("chord_strum_mode", False)))
-        self.chk_strum_mode.toggled.connect(self._on_strum_mode_toggled)
-        row_arp.addWidget(self.chk_strum_mode)
-        self.cmb_pattern = QComboBox()
-        self.cmb_pattern.addItem("固定从低到高", "ascending")
-        self.cmb_pattern.setVisible(False)
-        row_arp.addWidget(self.cmb_pattern)
-        row_arp.addStretch(1)
-        a.addLayout(row_arp)
         v.addWidget(c1)
 
         # 卡片 2：游戏内三步准备 + 演奏主控
@@ -393,12 +588,26 @@ class MainWindow(QMainWindow):
         b = QVBoxLayout(c2)
         b.setContentsMargins(12, 10, 12, 10)
         b.setSpacing(6)
-        b.addWidget(self._section("① 演奏前游戏内准备步骤"))
+        b.addWidget(self._section("演奏前游戏内准备步骤"))
         self.lbl_guide = QLabel("（选完歌，这里会写出三步）")
         self.lbl_guide.setObjectName("guide_text")
         self.lbl_guide.setWordWrap(True)
         self.lbl_guide.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        b.addWidget(self.lbl_guide)
+        row_g = QHBoxLayout()
+        row_g.setSpacing(10)
+        row_g.addWidget(self.lbl_guide, 1)
+        col_tools = QVBoxLayout()
+        col_tools.setSpacing(6)
+        self.btn_calibrate = QPushButton("◎ 指示圈校准轮盘")
+        self.btn_calibrate.setMinimumWidth(200)
+        self.btn_calibrate.clicked.connect(self._auto_calibrate)
+        col_tools.addWidget(self.btn_calibrate)
+        self.btn_diag = QPushButton("✦ 4 步硬件自检")
+        self.btn_diag.setMinimumWidth(200)
+        self.btn_diag.clicked.connect(self._open_diag)
+        col_tools.addWidget(self.btn_diag)
+        row_g.addLayout(col_tools)
+        b.addLayout(row_g)
         row2 = QHBoxLayout()
         self.btn_play = QPushButton("▶ 开始演奏（F8）")
         self.btn_play.setObjectName("playBtn")
@@ -418,12 +627,6 @@ class MainWindow(QMainWindow):
         self.chk_sync = QCheckBox("整 5 秒双人同步")
         row2.addWidget(self.chk_sync)
         row2.addStretch(1)
-        self.btn_calibrate = QPushButton("◎ 指示圈校准轮盘")
-        self.btn_calibrate.clicked.connect(self._auto_calibrate)
-        row2.addWidget(self.btn_calibrate)
-        self.btn_diag = QPushButton("✦ 4 步硬件自检")
-        self.btn_diag.clicked.connect(self._open_diag)
-        row2.addWidget(self.btn_diag)
         b.addLayout(row2)
         v.addWidget(c2)
 
@@ -458,6 +661,7 @@ class MainWindow(QMainWindow):
         self.log.setMaximumBlockCount(2000)
         c.addWidget(self.log, 1)
         v.addWidget(c3, 1)
+        self.refresh_midi_list()
 
     def _section(self, text):
         lab = QLabel(text)
@@ -475,67 +679,66 @@ class MainWindow(QMainWindow):
                 self.load(p)
                 return
 
-    def open_file(self):
-        self._append_log("打开文件对话框……")
-        dlg = QFileDialog(self, "选一份 MIDI", "", "MIDI 文件 (*.mid *.midi)")
-        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
-        dlg.setFileMode(QFileDialog.ExistingFile)
-        if dlg.exec_():
-            files = dlg.selectedFiles()
-            if files:
-                self.load(files[0])
-
     def open_test_midi(self):
-        try:
-            os.makedirs(TEST_MIDI_DIR, exist_ok=True)
-        except Exception as exc:
-            self._append_log("! 建不了 test_midis 文件夹：%s" % exc)
-        self._append_log("选择测试MIDI……（默认目录 %s）" % TEST_MIDI_DIR)
-        dlg = QFileDialog(self, "选择测试MIDI", TEST_MIDI_DIR, "MIDI 文件 (*.mid)")
-        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
-        dlg.setFileMode(QFileDialog.ExistingFile)
-        dlg.setDirectory(TEST_MIDI_DIR)
-        if dlg.exec_():
-            files = dlg.selectedFiles()
-            if files:
-                self.load(files[0])
+        """加载内置测试 MIDI"""
+        demo = os.path.join(TEST_MIDI_DIR, "sample_demo.mid")
+        if not os.path.isfile(demo):
+            try:
+                cands = [os.path.join(TEST_MIDI_DIR, f) for f in os.listdir(TEST_MIDI_DIR)
+                         if f.lower().endswith((".mid", ".midi"))]
+                demo = cands[0] if cands else ""
+            except Exception:
+                demo = ""
+        if demo and os.path.isfile(demo):
+            self.load(demo)
+        else:
+            QMessageBox.information(self, "未找到测试曲", "未找到内置测试曲：%s" % demo)
 
     def _build_advanced(self, v):
-        """帧率预设（直接放主界面）+「高级时间参数」按钮行。"""
+        """帧率预设（主界面醒目按钮）+「高级时间参数」按钮行。"""
         preset_row = QHBoxLayout()
-        preset_row.setSpacing(12)
+        preset_row.setSpacing(8)
         self.rad_preset = {}
         self.preset_group = QButtonGroup(self)
-        for key, text, tip in (
-                ("30fps", "30 帧预设（默认）", "单帧 33.3ms：最稳，低帧率下最不容易吞键/吞翻页"),
-                ("60fps", "60 帧预设", "单帧 16.7ms：均衡档，机器能稳跑 60 帧时选它"),
-                ("90fps", "90 帧预设", "单帧 11.1ms：高刷机器用，动作预算最紧")):
-            rb = QRadioButton(text)
-            rb.setToolTip(tip)
-            rb.setObjectName("roleRadio")
-            rb.toggled.connect(lambda on, k=key: on and self.apply_timing_preset(k))
-            self.preset_group.addButton(rb)
-            self.rad_preset[key] = rb
-            preset_row.addWidget(rb)
-        preset_row.addStretch(1)
+        self.preset_group.setExclusive(True)
+        tips = {
+            "30fps": "单帧 33.3ms：最稳，慢速与密集曲都不易吞键",
+            "60fps": "单帧 16.7ms：均衡档，机器能稳跑 60 帧时选它",
+            "90fps": "单帧 11.1ms：高刷机器用，动作预算最紧",
+        }
+        for key in ("30fps", "60fps", "90fps"):
+            title, bpm = PC.PRESET_INFO[key]
+            btn = QPushButton("%s\n%s" % (title, bpm))
+            btn.setObjectName("presetBtn")
+            btn.setCheckable(True)
+            btn.setMinimumHeight(52)
+            btn.setToolTip(tips[key])
+            btn.toggled.connect(lambda on, k=key: on and self.apply_timing_preset(k))
+            self.preset_group.addButton(btn)
+            self.rad_preset[key] = btn
+            preset_row.addWidget(btn, 1)
         v.addLayout(preset_row)
 
-        self.lbl_preset_tip = QLabel(
-            "提示：预设越高游戏帧数达不到可能会吞音，编排后如果音符晚出再考虑选择高帧预设。")
-        self.lbl_preset_tip.setObjectName("sub")
-        self.lbl_preset_tip.setWordWrap(True)
-        v.addWidget(self.lbl_preset_tip)
+        # 若检测到本地仍是旧版配置（min_action_interval > 0.005），自动迁移写入新版 30fps 默认预设
+        if self._current_preset_name() is None:
+            try:
+                if float(PC.load_timing().get("min_action_interval", 0.035)) > 0.005:
+                    PC.save_timing(PC.TIMING_PRESETS[PC.DEFAULT_TIMING_PRESET], merge=False)
+            except Exception:
+                pass
         self._sync_preset_radios()
 
         row = QHBoxLayout()
-        self.btn_adv = QPushButton("⚙ 高级时间参数 (18项)…")
-        self.btn_adv.setToolTip("打开独立弹窗逐项调整 18 项底层时间参数；保存后下次编译/演奏生效")
+        row.setSpacing(10)
+        self.btn_adv = QPushButton("⚙ 高级时间参数 (6项)…")
+        self.btn_adv.setToolTip("打开独立弹窗调整 6 项核心时间参数；保存后立即重编生效")
         self.btn_adv.clicked.connect(self._open_timing_dialog)
         row.addWidget(self.btn_adv)
-        hint = QLabel("支持 30帧(默认) / 60帧 / 90帧 预设切换与 18 项参数自由微调")
-        hint.setObjectName("sub")
-        row.addWidget(hint)
-        row.addStretch(1)
+        self.lbl_preset_tip = QLabel(
+            "提示：先按歌曲 BPM 选一档；进游戏若吞音/漏翻页请【降一档】，若编排提示音符晚出请【升一档】。")
+        self.lbl_preset_tip.setObjectName("sub")
+        self.lbl_preset_tip.setWordWrap(True)
+        row.addWidget(self.lbl_preset_tip, 1)
         v.addLayout(row)
 
         self.adv_box = QGroupBox("")
@@ -675,7 +878,7 @@ class MainWindow(QMainWindow):
             s1 = t.switch_span(1, True, True)
             s2 = t.switch_span(2, True, True)
             self.lbl_timing_budget.setText(
-                "换格/翻页预算（按当前 18 项实时计算）：\n"
+                "换格/翻页预算（按当前 6 项 + 底层 12 项实时计算）：\n"
                 "同页换格 %.0f ms = 2×最小间隔 + 点格按住 + 同页等待\n"
                 "翻 1 页 %.0f ms = 翻页键按住 + 松开后根音延迟 + 翻页后等待 + 点格按住 + 跨页等待\n"
                 "翻 2 页 %.0f ms = 2×翻页按住 + 连按间隔 + 松开后根音延迟 + 翻页后等待 + 点格按住 + 跨页等待"
@@ -694,7 +897,7 @@ class MainWindow(QMainWindow):
         return None
 
     def _sync_preset_radios(self, name=None):
-        name = name or self._current_preset_name()
+        name = name or self._current_preset_name() or PC.DEFAULT_TIMING_PRESET
         for key, rb in (getattr(self, "rad_preset", None) or {}).items():
             try:
                 rb.blockSignals(True)
@@ -745,7 +948,7 @@ class MainWindow(QMainWindow):
                 self.lbl_timing_hint.setText(self._timing_hint_base)
             except Exception:
                 pass
-            self._append_log("已保存 %d 项参数（立即重编并刷新卷帘）" % n)
+            self._append_log("已保存 %d 项参数（按住时长已同步到 6 个底层键；立即重编并刷新卷帘）" % n)
             self._sync_preset_radios()
             if self.path:
                 self._compile()
@@ -958,47 +1161,6 @@ class MainWindow(QMainWindow):
                             "开" if enable_chord_rhythm else "关"))
         if self.path:
             self._compile()
-
-    def toggle_role_preview(self):
-        """主界面一键试听当前选中角色的编译声部（支持停止）。"""
-        import tempfile
-        import winsound
-        if getattr(self, "_role_preview_playing", False):
-            try:
-                winsound.PlaySound(None, winsound.SND_PURGE)
-            except Exception:
-                pass
-            self._role_preview_playing = False
-            if hasattr(self, "btn_preview_role"):
-                self.btn_preview_role.setText("♪ 试听当前角色")
-            self._append_log("⏹ 已停止角色试听")
-            return
-        if not self.path or not os.path.isfile(self.path):
-            QMessageBox.information(self, "还没选歌", "先选一份 MIDI，再点击试听。")
-            return
-        try:
-            from piano_roll import PianoRollModel
-            m = PianoRollModel(self.path, role=self.role)
-            if self.role in self.custom_role_notes:
-                m.notes = [dict(n) for n in self.custom_role_notes[self.role]]
-            if not m.notes:
-                QMessageBox.information(self, "无音符", "当前角色没有可试听的音符。")
-                return
-            self._append_log("正在合成 [%s] 试听音频（%d 颗音）…" % (MC.ROLE_CN.get(self.role, self.role), len(m.notes)))
-            QApplication.processEvents()
-            wav_bytes = PianoRollModel.synthesize_wav(m.notes, m.bpm)
-            fd, wpath = tempfile.mkstemp(prefix="yjyz_role_", suffix=".wav")
-            os.close(fd)
-            with open(wpath, "wb") as f:
-                f.write(wav_bytes)
-            winsound.PlaySound(wpath, winsound.SND_FILENAME | winsound.SND_ASYNC)
-            self._role_preview_playing = True
-            self._role_preview_wav = wpath
-            if hasattr(self, "btn_preview_role"):
-                self.btn_preview_role.setText("⏹ 停止试听")
-            self._append_log("▶ 正在试听 [%s]（共 %d 颗音，再次点击按钮可停止）" % (MC.ROLE_CN.get(self.role, self.role), len(m.notes)))
-        except Exception as exc:
-            self._append_log("× 试听失败：%s" % exc)
 
     def open_piano_roll(self):
         """打开钢琴卷帘：直接进当前角色的转译序列模式，并延续上一次应用的微调。"""

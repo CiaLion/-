@@ -157,8 +157,16 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        self.resize(1080, 780)
-        self.setMinimumSize(760, 520)
+        try:
+            _avail = QApplication.desktop().availableGeometry(self)
+            _w = min(1080, int(_avail.width() * 0.94))
+            _h = min(780, int(_avail.height() * 0.92))
+            _minw = min(760, int(_avail.width() * 0.72))
+            _minh = min(520, int(_avail.height() * 0.62))
+        except Exception:
+            _w, _h, _minw, _minh = 1080, 780, 760, 520
+        self.resize(max(_minw, _w), max(_minh, _h))
+        self.setMinimumSize(_minw, _minh)
 
         self.worker = None
         self.probe = None
@@ -188,7 +196,9 @@ class MainWindow(QMainWindow):
         outer.setSpacing(10)
 
         outer.addWidget(self._build_inputs_card(), 0)
-        outer.addWidget(self._build_pipeline_row(), 0)
+        self._pipeline_card = self._build_pipeline_row()
+        outer.addWidget(self._pipeline_card, 0)
+        self._pipeline_card.hide()
         outer.addWidget(self._build_log(), 1)
 
         # 兼容旧引用：保留一个隐藏的 tabs（不再显示，也不承载控件）
@@ -262,8 +272,8 @@ class MainWindow(QMainWindow):
 
         grid.addWidget(self._mini_label("音色适配", 84), 1, 0)
         self.s3_instrument = QComboBox()
-        self.s3_instrument.addItem("木吉他模式（默认）", "acoustic")
         self.s3_instrument.addItem("电吉他模式", "electric")
+        self.s3_instrument.addItem("木吉他模式", "acoustic")
         self.s3_instrument.setMinimumWidth(150)
         grid.addWidget(self.s3_instrument, 1, 1)
 
@@ -305,6 +315,7 @@ class MainWindow(QMainWindow):
         row_adv = QHBoxLayout()
         row_adv.addWidget(self.btn_paths_adv)
         row_adv.addStretch(1)
+        self.btn_paths_adv.setVisible(False) 
         v.addLayout(row_adv)
 
         self.paths_box = QWidget()
@@ -358,6 +369,10 @@ class MainWindow(QMainWindow):
         self.btn_open_out.setObjectName("ghost")
         self.btn_open_out.clicked.connect(self._open_out_dir)
         row_btns.addWidget(self.btn_open_out)
+        self.btn_roll_final = QPushButton("卷帘微调成品")
+        self.btn_roll_final.setObjectName("ghost")
+        self.btn_roll_final.clicked.connect(lambda: self.open_piano_roll(3))
+        row_btns.addWidget(self.btn_roll_final)
         row_btns.addStretch(1)
         self.chk_auto_send = QCheckBox("完成后自动送入演奏台")
         row_btns.addWidget(self.chk_auto_send)
@@ -706,7 +721,12 @@ class MainWindow(QMainWindow):
         self.s3_name.setText(str(s3.get("name") or ""))
         self.s3_low.setValue(int(s3.get("low") or 40))
         self.s3_high.setValue(int(s3.get("high") or 88))
-        mode = str(s3.get("instrument_mode") or "acoustic")
+        try:
+            _ver = int(data.get("version") or 0)
+        except Exception:  # noqa: BLE001
+            _ver = 0
+        mode = ("electric" if _ver < 3
+                else str(s3.get("instrument_mode") or "electric"))
         pos = self.s3_instrument.findData(mode)
         self.s3_instrument.setCurrentIndex(pos if pos >= 0 else 0)
         idx = {"auto": 0, "xpu": 1, "cuda": 2, "cpu": 3}.get(
@@ -724,7 +744,7 @@ class MainWindow(QMainWindow):
 
     def _save_settings(self) -> None:
         data = {
-            "version": 2,
+            "version": 3,
             "device": self._device_key(),
             "step1": {"audio": self.s1_audio.text().strip(),
                       "outdir": _out_store(self.s1_out.text()),

@@ -30,6 +30,7 @@ DEFAULTS = {
     "enable_arpeggio": True, # 开启指弹横按琶音（伴奏与独奏空隙展开为流水琶音）
     # 2P 和弦伴奏是否按真实单拍做整拍扫弦律动（关 = 每个切片只扫 1 次）
     "enable_chord_rhythm": True,
+    "roll_volume": 35,       # 卷帘试听音量（0~100）
     "timing": {},            # 延迟参数（见 TIMING_INFO），空 = 全用默认
 }
 
@@ -42,59 +43,71 @@ LEVEL_FREE = "✅ 可自由调整：只影响快慢，不影响能否发出"
 
 TIMING_PRESETS = {
     "30fps": {
-        "min_action_interval": 0.035, "fret_click_hold": 0.040, "pluck_hold": 0.040,
-        "sustain_max": 4.0, "select_click_hold": 0.040, "strum_park_wait": 0.035,
-        "strum_click_hold": 0.042, "strum_hold": 0.0, "page_key_hold": 0.040,
-        "page_turn_gap": 0.040, "after_page_key_release": 0.048,
+        "min_action_interval": 0.001, "fret_click_hold": 0.034, "pluck_hold": 0.034,
+        "sustain_max": 4.0, "select_click_hold": 0.034, "strum_park_wait": 0.001,
+        "strum_click_hold": 0.034, "strum_hold": 0.0, "page_key_hold": 0.034,
+        "page_turn_gap": 0.034, "after_page_key_release": 0.035,
         "settle_after_page_turn": 0.0, "settle_same_page": 0.0,
-        "settle_page_turn": 0.0, "sustain_min": 0.30, "repluck_gap": 0.040,
+        "settle_page_turn": 0.0, "sustain_min": 0.30, "repluck_gap": 0.034,
         "start_delay": 3.0, "preschedule_lead": 0.0,
     },
     "60fps": {
-        "min_action_interval": 0.020, "fret_click_hold": 0.028, "pluck_hold": 0.028,
-        "sustain_max": 4.0, "select_click_hold": 0.028, "strum_park_wait": 0.020,
-        "strum_click_hold": 0.030, "strum_hold": 0.0, "page_key_hold": 0.028,
-        "page_turn_gap": 0.025, "after_page_key_release": 0.035,
+        "min_action_interval": 0.001, "fret_click_hold": 0.017, "pluck_hold": 0.017,
+        "sustain_max": 4.0, "select_click_hold": 0.017, "strum_park_wait": 0.001,
+        "strum_click_hold": 0.017, "strum_hold": 0.0, "page_key_hold": 0.017,
+        "page_turn_gap": 0.017, "after_page_key_release": 0.018,
         "settle_after_page_turn": 0.0, "settle_same_page": 0.0,
-        "settle_page_turn": 0.0, "sustain_min": 0.30, "repluck_gap": 0.028,
+        "settle_page_turn": 0.0, "sustain_min": 0.30, "repluck_gap": 0.017,
         "start_delay": 3.0, "preschedule_lead": 0.0,
     },
     "90fps": {
-        "min_action_interval": 0.014, "fret_click_hold": 0.020, "pluck_hold": 0.020,
-        "sustain_max": 4.0, "select_click_hold": 0.020, "strum_park_wait": 0.015,
-        "strum_click_hold": 0.022, "strum_hold": 0.0, "page_key_hold": 0.020,
-        "page_turn_gap": 0.018, "after_page_key_release": 0.025,
+        "min_action_interval": 0.001, "fret_click_hold": 0.012, "pluck_hold": 0.012,
+        "sustain_max": 4.0, "select_click_hold": 0.012, "strum_park_wait": 0.001,
+        "strum_click_hold": 0.012, "strum_hold": 0.0, "page_key_hold": 0.012,
+        "page_turn_gap": 0.012, "after_page_key_release": 0.013,
         "settle_after_page_turn": 0.0, "settle_same_page": 0.0,
-        "settle_page_turn": 0.0, "sustain_min": 0.30, "repluck_gap": 0.020,
+        "settle_page_turn": 0.0, "sustain_min": 0.30, "repluck_gap": 0.012,
         "start_delay": 3.0, "preschedule_lead": 0.0,
     },
 }
-DEFAULT_TIMING_PRESET = "60fps"
+DEFAULT_TIMING_PRESET = "30fps"
+
+# 帧率预设的展示文案（标题, 推荐 BPM）
+PRESET_INFO = {
+    "30fps": ("30 帧", "最稳 · BPM≤120"),
+    "60fps": ("60 帧", "均衡 · BPM120~170"),
+    "90fps": ("90 帧", "高刷 · BPM≥170"),
+}
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# 延迟参数总表：中文名 / 默认值 / 单位 / 允许范围 / 等级 / 说明
-#
-# 基准＝**20 毫秒**（两次动作之间的最小间隔）；
-# 按键/扫弦/翻页另有**实测下限**：按键保持 25ms、扫弦 30ms、翻页松开 35ms、
-# 同弦重拨 25ms —— 这些值写进默认值，界面上改小也不会低于下限。
-# **允许范围下限是 0**（下限由编译器里的实测边界兜底）。
-# 等级文字只写事实。
-# ══════════════════════════════════════════════════════════════════════════
+# 时间参数完整表（界面只显示 TIMING_UI_ORDER 里的 6 项，18 个键全部保留）。
 BASE_MS = 0.020                 # 全局时间基准：20 毫秒
-TIMING_INFO = [
+
+# 界面展示的 6 项
+TIMING_UI_ORDER = (
+    "after_page_key_release",
+    "pluck_hold",
+    "min_action_interval",
+    "sustain_min",
+    "sustain_max",
+    "start_delay",
+)
+
+# 完整 18 项（读写配置、范围钳制、命令行表格）
+TIMING_INFO_ALL = [
     # key, 中文名, 默认值, 单位, 最小, 最大, 等级, 说明
-    ("min_action_interval", "两次动作之间至少隔多久（全局基准）", 0.020, "秒", 0.0, 0.5,
-     "✅ 全局基准：20 毫秒（0.020 秒）",
-     "任何两个动作排得太近时，生成计划的一方都按这个数当最小间隔。"
-     "6 根弦之间无密度限制，所以这也是弦与弦之间的默认间隔。"),
+    ("min_action_interval", "无需松开触发动作衔接延迟", 0.001, "秒", 0.0, 0.5,
+     "✅ 默认统一 1 毫秒（0.001 秒）",
+     "上一步不需要松开就能触发下一步时，两步之间隔这么久。"
+     "例如左键点换扇区之后 1 毫秒就立刻按弦。"),
     ("fret_click_hold", "点轮盘格子的按住时长", 0.025, "秒", 0.0, 0.30,
      "⚠ 实测边界：按键保持 25 毫秒，改小可能发不出去",
      "换品格时「点一下扇区」按住 25 毫秒（实测下限；改小游戏可能整帧看不到）。"),
-    ("pluck_hold", "拨弦按住时长（短音）", 0.025, "秒", 0.0, 1.0,
-     "⚠ 实测边界：按键保持 25 毫秒",
-     "短音就是「按一下数字键」，**按住 25 毫秒**松手（实测下限）。"
-     "长音（时值 ≥「多短的音就不长按了」）改由「长按延音上限」决定。"),
+    ("pluck_hold", "按键与点选按住时长", 0.017, "秒", 0.0, 1.0,
+     "⚠ 实测边界：帧时长 + 1ms（30帧 34ms / 60帧 17ms / 90帧 12ms）",
+     "数字键拨弦和鼠标点格共用的按住时长。**保存这一项时会同步写回** "
+     "page_key_hold / fret_click_hold / select_click_hold / strum_click_hold / "
+     "page_turn_gap / repluck_gap，所以界面只留这一个入口就够了。"),
     ("sustain_max", "长按延音上限", 4.0, "秒", 0.0, 8.0,
      "✅ 可自由调整｜★ 设 0 会让延音完全失效；游戏侧约 4.05 秒到顶",
      "**这一条不是等待，是游戏侧的物理上限**：实测按住约 4.05 秒就到顶。"
@@ -119,10 +132,10 @@ TIMING_INFO = [
     ("page_turn_gap", "连按翻页之间的间隔", 0.020, "秒", 0.0, 1.0,
      "✅ 全局基准：20 毫秒",
      "一次要翻好几页时，两次按键之间等 20 毫秒。"),
-    ("after_page_key_release", "翻页键松开后多久根音才变", 0.035, "秒", 0.0, 0.5,
-     "⚠ 实测边界：35 毫秒，改小会提前拨到旧根音",
-     "**松开翻页键之后要等 0.035 秒，新的音高才生效**，"
-     "所以这 35 毫秒里不能去拨弦（实测值）。"),
+    ("after_page_key_release", "翻页 / Z 切模式松开后生效延迟", 0.018, "秒", 0.0, 0.5,
+     "⚠ 实测边界：帧时长 + 2ms（30帧 35ms / 60帧 18ms / 90帧 13ms）",
+     "翻页键（T/R）或 Z 键**松开之后**要等这么久，新的根音 / 模式才真正生效，"
+     "这段时间里不能拨弦（实测值）。"),
     ("settle_after_page_turn", "翻页后等多久再演奏", 0.0, "秒", 0.0, 1.0,
      "✅ 可自由调整｜实测 0（翻页键松开 35ms 已经够）",
      "翻完最后一页之后、再发下一个动作之前额外等待。"
@@ -134,15 +147,15 @@ TIMING_INFO = [
     ("settle_page_turn", "跨页换格子后等待", 0.0, "秒", 0.0, 1.0,
      "✅ 可自由调整｜实测 0",
      "换格子同时还要翻页时的额外等待。实测 0，理由同上。"),
-    ("sustain_min", "多短的音就不长按了", 0.30, "秒", 0.0, 2.0,
-     "✅ 可自由调整｜不是等待，是判断门槛",
+    ("sustain_min", "长按延音判断门槛", 0.30, "秒", 0.0, 2.0,
+     "✅ 不是等待，是判断门槛",
      "**这一条不是等待，是判断门槛**：时值短于它的音就点一下（长按反而拖拍）。"
      "只影响生成脚本时的判断。"),
     ("repluck_gap", "同一根弦再拨的最小间隔", 0.025, "秒", 0.0, 0.5,
      "⚠ 实测边界：25 毫秒，改小游戏不认",
      "同一根弦**两次按下之间**至少隔 25 毫秒（实测）。短于这个数，"
      "第二次拨弦会被游戏吞掉，所以编译器还会先补一个「松开」。"),
-    ("start_delay", "开始演奏前的等待", 3.0, "秒", 0.0, 15.0,
+    ("start_delay", "开始演奏前切回游戏等待", 3.0, "秒", 0.0, 15.0,
      "✅ 可自由调整：留给你切回游戏",
      "编译时给整条时间轴统一加的开头留白。默认 3 秒，够切回游戏窗口。"),
     ("preschedule_lead", "预调度额外提前量", 0.0, "秒", 0.0, 0.5,
@@ -157,7 +170,7 @@ TIMING_ALIASES = {}
 
 TIMING_DEFAULTS = {}
 TIMING_META = {}
-for (_k, _cn, _d, _u, _lo, _hi, _lv, _note) in TIMING_INFO:
+for (_k, _cn, _d, _u, _lo, _hi, _lv, _note) in TIMING_INFO_ALL:
     TIMING_DEFAULTS[_k] = _d
     TIMING_META[_k] = {"key": _k, "cn": _cn, "default": _d, "unit": _u,
                        "min": _lo, "max": _hi, "level": _lv, "note": _note}
@@ -177,7 +190,27 @@ for _k, _meta in TIMING_META.items():
     if _k in TIMING_DEFAULTS:
         _meta["default"] = TIMING_DEFAULTS[_k]
 
-TIMING_KEYS = [row[0] for row in TIMING_INFO]
+TIMING_KEYS = [row[0] for row in TIMING_INFO_ALL]      # 全部 18 个键（读写配置用）
+
+# 界面只展示这 6 项（按 TIMING_UI_ORDER 的顺序）
+TIMING_INFO = [row for row in TIMING_INFO_ALL if row[0] in TIMING_UI_ORDER]
+TIMING_INFO.sort(key=lambda _row: TIMING_UI_ORDER.index(_row[0]))
+TIMING_UI_KEYS = [row[0] for row in TIMING_INFO]
+
+# 「按键与点选按住时长」在底层是 6 个键；界面上只留 pluck_hold 一个入口，
+# 保存时把它的值同步写回下面这 6 项（各自按自己的允许范围钳制）。
+PLUCK_MIRROR_KEYS = ("page_key_hold", "fret_click_hold", "select_click_hold",
+                     "strum_click_hold", "page_turn_gap", "repluck_gap")
+
+
+def expand_pluck_hold(values):
+    """把界面上的 pluck_hold 同步铺开到 6 个底层键（不覆盖显式给出的键）。"""
+    out = dict(values or {})
+    if "pluck_hold" in out:
+        v = out["pluck_hold"]
+        for k in PLUCK_MIRROR_KEYS:
+            out.setdefault(k, v)
+    return out
 
 # ── 「全部设为 0」时**保持不动**的项 ─────────────────────────────────────
 # ① 翻页这一组（不参与归零）：
@@ -250,6 +283,7 @@ def save_timing(values, merge=True):
     """
     cur = load()
     t = dict(cur.get("timing") or {}) if merge else {}
+    values = expand_pluck_hold(values)
     for k in TIMING_KEYS:
         if k in (values or {}):
             t[k] = _clamp(k, values[k])
@@ -349,7 +383,7 @@ def save(settings):
             data[k] = settings[k]
     # timing 单独合并（不能整块覆盖，否则界面只改一项会把其余项清掉）
     timing = data.get("timing") or {}
-    got = (settings or {}).get("timing")
+    got = expand_pluck_hold((settings or {}).get("timing"))
     if isinstance(got, dict):
         for k in TIMING_KEYS:
             if k in got:
