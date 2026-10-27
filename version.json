@@ -21,7 +21,7 @@
     "player/midi_compiler.py": "ce7e912c37fcdf1002fcc84d396a74bfc23994518f33508fa550ef3835d2cd9c",
     "player/midi_loader.py": "fab0f29effb0dbcc83ada5b5ef3d0dab1429458b02fa7c3430e4714a589f6edd",
     "player/modes.py": "c63eacc31a1697951c79ac9f0c0da57a1dc33aa96d273c79658228c9ce6df2d8",
-    "player/multipart_studio.py": "48498c96acf4194706e87e7ca3e25660bf45743162cd0cc5e775917e78f362de",
+    "player/multipart_studio.py": "fea02fa9f5148ff498c02cd01141e627ecf2c6a4c116b81fdfabbf6fbe293953",
     "player/piano_roll.py": "02bd6a55e611651ecb2750b99acdc1fd14bfe6b8bf9aa40c8e3c1d86cd3ecbea",
     "player/plan.py": "2707b78fa306798de3ae0cec0351b41ebb571e8b472e4fba7cebaccd95fa32fb",
     "player/player_config.py": "eadfa4a39da578bff2fab3fddbed8f245450ee14595c879ccd1175a5d029282a",
