@@ -35,7 +35,7 @@ import player_config as PC  # noqa: E402
 
 OUT_DIR = os.path.join(ROOT, "out")
 OPEN_PITCH = MC.OPEN_PITCH
-DRUM_HINT = re.compile(r"drum|percussion|kit|tama|cymbal")
+DRUM_HINT = re.compile(r"\b(drum|drums|percussion|cymbals?)\b|\bdrum\s*kit\b|\btama\b", re.IGNORECASE)
 DRUM_INSTRUMENT_ID = "1024"
 CDN_HOSTS = ("dqsljvtekg760.cloudfront.net", "d3d3l6a6rcgkaf.cloudfront.net")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
