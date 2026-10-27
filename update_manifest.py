@@ -27,6 +27,11 @@ MANAGED_PATTERNS = (
     "transcriber/*.py",
     "setup/*.ps1",
     "vendor/sheetsage2/transcribe_cli.py",
+    "vendor/sheetsage2/requirements-base.txt",
+    "vendor/sheetsage2/requirements-sep.txt",
+    "vendor/sheetsage2/sep_runner.py",
+    "vendor/sheetsage2/roformer_device.py",
+    "vendor/sheetsage2/patched_model_py/hardware_router.py",
 )
 
 # 只是开发者本机的内部工具，不参与发布/更新

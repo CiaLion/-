@@ -10,6 +10,7 @@ import ast
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -157,11 +158,18 @@ def fetch_remote_manifest(sources=None, timeout=SOURCE_TIMEOUT, log=None):
     raise UpdateError("所有更新源都没能取到清单：\n" + "\n".join(errors))
 
 
+def _parse_version(text):
+    nums = [int(x) for x in re.findall(r"\d+", str(text or ""))]
+    while nums and nums[-1] == 0:
+        nums.pop()
+    return tuple(nums) if nums else (0,)
+
+
 def check_for_update(sources=None, timeout=SOURCE_TIMEOUT, log=None):
     """检查有没有更新。
 
     返回 dict：
-      status        "latest" / "update"
+      status        "latest" / "ahead" / "update"
       local_version / remote_version / changelog
       changed       需要更新的文件（相对路径列表）
       skipped       因属于用户配置/输出目录而跳过的文件
@@ -183,10 +191,16 @@ def check_for_update(sources=None, timeout=SOURCE_TIMEOUT, log=None):
         else:
             changed.append(rel)
 
+    local_version = str(local.get("version") or "")
+    remote_version = str(remote.get("version") or "")
+    status = "update" if changed else "latest"
+    if _parse_version(local_version) > _parse_version(remote_version):
+        status, changed = "ahead", []
+
     return {
-        "status": "update" if changed else "latest",
-        "local_version": str(local.get("version") or ""),
-        "remote_version": str(remote.get("version") or ""),
+        "status": status,
+        "local_version": local_version,
+        "remote_version": remote_version,
         "changelog": list(remote.get("changelog") or []),
         "changed": sorted(changed),
         "same_count": same,
@@ -305,8 +319,15 @@ def apply_update(info, staged, log=None, progress=None):
         dst = local_path(rel)
         if os.path.isfile(dst):
             bak = os.path.join(BACKUP_DIR, rel.replace("/", os.sep))
-            os.makedirs(os.path.dirname(bak) or BACKUP_DIR, exist_ok=True)
-            shutil.copy2(dst, bak)
+            try:
+                os.makedirs(os.path.dirname(bak) or BACKUP_DIR, exist_ok=True)
+                shutil.copy2(dst, bak)
+            except Exception as exc:  # noqa: BLE001
+                msg = "备份失败：%s（%s）" % (rel, exc)
+                if log:
+                    log(msg)
+                print(msg)
+                raise UpdateError(msg)
             index["files"][rel] = sha256_file(dst)
         else:
             index["files"][rel] = None       # 更新前没有这个文件 → 回退时删掉
@@ -441,6 +462,9 @@ def _main(argv):
             print("远端版本：%s" % (info["remote_version"] or "未知"))
             if info["status"] == "latest":
                 print("当前已是最新版本 (v%s)" % (info["remote_version"] or "?"))
+            elif info["status"] == "ahead":
+                print("当前本地版本 (v%s) 高于远端发布版本 (v%s)，无需更新"
+                      % (info["local_version"] or "?", info["remote_version"] or "?"))
             else:
                 print("有 %d 个文件需要更新：" % len(info["changed"]))
                 for rel in info["changed"]:
@@ -448,8 +472,12 @@ def _main(argv):
             return 0
         if cmd == "apply":
             info = check_for_update(log=say)
-            if info["status"] == "latest":
-                print("当前已是最新版本 (v%s)" % (info["remote_version"] or "?"))
+            if info["status"] in ("latest", "ahead"):
+                if info["status"] == "ahead":
+                    print("当前本地版本 (v%s) 高于远端发布版本 (v%s)，无需更新"
+                          % (info["local_version"] or "?", info["remote_version"] or "?"))
+                else:
+                    print("当前已是最新版本 (v%s)" % (info["remote_version"] or "?"))
                 return 0
             staged = download_update(info, log=say, progress=say)
             summary = apply_update(info, staged, log=say, progress=say)

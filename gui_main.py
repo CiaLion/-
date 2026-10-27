@@ -19,6 +19,42 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+
+
+def heal_portable_venvs(root_dir):
+    """把两处 pyvenv.cfg 的 home/executable 指回当前 runtime，随目录移动自动修复。"""
+    import os
+    from pathlib import Path
+    root = Path(root_dir)
+    runtime = root / "runtime" / "python311"
+    exe = runtime / "python.exe"
+    if not exe.is_file():
+        return []
+    want = os.path.normcase(os.path.abspath(str(runtime)))
+    fixed = []
+    for cfg in (root / ".venv" / "pyvenv.cfg",
+                root / "vendor" / "sheetsage2" / ".venv" / "pyvenv.cfg"):
+        if not cfg.is_file():
+            continue
+        try:
+            lines = cfg.read_text(encoding="utf-8", errors="replace").splitlines()
+            changed = False
+            for i, line in enumerate(lines):
+                key = line.split("=", 1)[0].strip().lower() if "=" in line else ""
+                if key in ("home", "executable"):
+                    cur = line.split("=", 1)[1].strip()
+                    if os.path.normcase(os.path.abspath(cur)) != (
+                            want if key == "home" else os.path.normcase(os.path.abspath(str(exe)))):
+                        lines[i] = "%s = %s" % (key, runtime if key == "home" else exe)
+                        changed = True
+            if changed:
+                cfg.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                fixed.append(str(cfg))
+        except Exception:
+            pass
+    return fixed
+
+
 for _p in (ROOT, ROOT / "player", ROOT / "transcriber"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
@@ -698,6 +734,10 @@ class UpdateDialog(QDialog):
             self.lbl_status.setText("共核对 %d 个文件，全部一致，无需更新。"
                                     % int(info.get("same_count") or 0))
             self.btn_update.hide()
+        elif info.get("status") == "ahead":
+            self.lbl_title.setText("本地版本 v%s 高于远端 v%s" % (local_v, remote_v))
+            self.lbl_status.setText("远端还是旧版本，无需更新；更新按钮已停用，避免被反向覆盖。")
+            self.btn_update.hide()
         else:
             self.lbl_title.setText("发现新版本 v%s（%d 个文件需要更新）"
                                    % (remote_v, len(changes)))
@@ -845,14 +885,12 @@ class UnifiedWindow(QMainWindow):
         self.lbl_admin = QLabel("管理员：检测中…")
         pill_css = ("padding: 3px 9px; border-radius: 6px; font-size: 12px; "
                     "background: rgba(148, 163, 184, 0.12);")
+        self.lbl_ai.setMaximumWidth(260)
         for w in (self.lbl_ai, self.lbl_game, self.lbl_admin):
             w.setStyleSheet(pill_css)
             top.addWidget(w)
         top.addStretch(1)
-        self.lbl_hotkey = QLabel("[F8] 开始/暂停  [F12] 紧急停止")
-        self.lbl_hotkey.setObjectName("sub")
-        top.addWidget(self.lbl_hotkey)
-        top.addSpacing(4)
+        title.setToolTip("[F8] 开始/暂停　[F12] 紧急停止")
         self.theme_mode = GT.load_mode() or "dark"
         self._env_dialog = None
         self.btn_env_check = QPushButton("环境与显卡体检")
@@ -1068,6 +1106,10 @@ class UnifiedWindow(QMainWindow):
 
     def closeEvent(self, ev):
         try:
+            PC.clean_tmp_wav()
+        except Exception:
+            pass
+        try:
             self.a.close()
         except Exception:
             pass
@@ -1099,6 +1141,11 @@ def _load_app_icon():
 
 
 def main(argv=None):
+    heal_portable_venvs(ROOT)
+    try:
+        PC.clean_tmp_wav()
+    except Exception:
+        pass
     argv = list(sys.argv if argv is None else argv)
     # High-DPI 抗锯齿（必须在 QApplication 创建之前设置）
     try:

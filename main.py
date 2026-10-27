@@ -13,8 +13,46 @@ import traceback
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
+
+
+def heal_portable_venvs(root_dir):
+    """把两处 pyvenv.cfg 的 home/executable 指回当前 runtime，随目录移动自动修复。"""
+    import os
+    from pathlib import Path
+    root = Path(root_dir)
+    runtime = root / "runtime" / "python311"
+    exe = runtime / "python.exe"
+    if not exe.is_file():
+        return []
+    want = os.path.normcase(os.path.abspath(str(runtime)))
+    fixed = []
+    for cfg in (root / ".venv" / "pyvenv.cfg",
+                root / "vendor" / "sheetsage2" / ".venv" / "pyvenv.cfg"):
+        if not cfg.is_file():
+            continue
+        try:
+            lines = cfg.read_text(encoding="utf-8", errors="replace").splitlines()
+            changed = False
+            for i, line in enumerate(lines):
+                key = line.split("=", 1)[0].strip().lower() if "=" in line else ""
+                if key in ("home", "executable"):
+                    cur = line.split("=", 1)[1].strip()
+                    if os.path.normcase(os.path.abspath(cur)) != (
+                            want if key == "home" else os.path.normcase(os.path.abspath(str(exe)))):
+                        lines[i] = "%s = %s" % (key, runtime if key == "home" else exe)
+                        changed = True
+            if changed:
+                cfg.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                fixed.append(str(cfg))
+        except Exception:
+            pass
+    return fixed
+
+
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+heal_portable_venvs(ROOT)
 
 
 def _ensure_qt_paths():

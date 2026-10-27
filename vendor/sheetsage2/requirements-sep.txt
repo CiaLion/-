@@ -1,0 +1,8 @@
+# 原生分离（HT-Demucs / Mel-Band RoFormer）额外依赖，装在 vendor/sheetsage2/.venv
+# 注意：audio-separator 必须锁 0.30.2；0.47.x 的 RoFormer 推理会输出近静音。
+audio-separator==0.30.2
+onnxruntime
+rotary-embedding-torch
+ml-collections
+beartype
+pydub

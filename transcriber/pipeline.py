@@ -325,6 +325,10 @@ try:
         info["cuda_build"] = str(getattr(torch.version, "cuda", "") or "")
     except Exception:
         info["cuda_build"] = ""
+    try:
+        info["hip"] = bool(getattr(torch.version, "hip", None))
+    except Exception:
+        info["hip"] = False
     if hasattr(torch, "xpu"):
         try:
             info["xpu"] = bool(torch.xpu.is_available())
@@ -371,7 +375,8 @@ def probe_device(force: bool = False) -> Dict[str, Any]:
 
     info: Dict[str, Any] = {"xpu": False, "cuda": False, "name": "",
                             "torch": "", "bf16": False, "fp16": False,
-                            "cuda_build": "", "ai_ready": ai_components_ready(),
+                            "cuda_build": "", "hip": False,
+                            "ai_ready": ai_components_ready(),
                             "probe_python": str(SHEETSAGE2_PY), "error": ""}
     if not SHEETSAGE2_PY.exists():
         info["error"] = f"探测 Python 不存在: {SHEETSAGE2_PY}"
@@ -394,22 +399,32 @@ def probe_device(force: bool = False) -> Dict[str, Any]:
             else:
                 info.update({k: payload.get(k, info[k]) for k in
                              ("xpu", "cuda", "name", "torch", "bf16",
-                              "fp16", "cuda_build", "error")})
+                              "fp16", "cuda_build", "hip", "error")})
         except Exception as exc:  # noqa: BLE001
             info["error"] = f"{type(exc).__name__}: {exc}"
 
     if info["xpu"]:
         info["best"] = "xpu"
+        info["vendor"] = "intel"
     elif info["cuda"]:
         info["best"] = "cuda"
+        lower_name = str(info.get("name") or "").lower()
+        info["vendor"] = ("amd" if info.get("hip") or "amd" in lower_name
+                          or "radeon" in lower_name else "nvidia")
     else:
         info["best"] = "cpu"
+        info["vendor"] = "cpu"
     _DEVICE_CACHE = dict(info)
     return dict(info)
 
 
+_DEVICE_ALIASES = {"amd": "cuda", "rocm": "cuda", "radeon": "cuda",
+                   "gpu": "cuda", "nvidia": "cuda", "intel": "xpu"}
+
+
 def resolve_device(requested: str = "auto") -> str:
     req = (requested or "auto").strip().lower()
+    req = _DEVICE_ALIASES.get(req, req)
     info = probe_device()
     available = {"cpu"}
     if info.get("xpu"):
@@ -424,10 +439,14 @@ def resolve_device(requested: str = "auto") -> str:
     return info.get("best") or "cpu"
 
 
-def resolve_dtype(device: str, requested: str = "bf16") -> str:
-    req = (requested or "bf16").strip().lower()
+def resolve_dtype(device: str, requested: str = "auto") -> str:
+    req = (requested or "auto").strip().lower()
     info = probe_device()
     dev = (device or "cpu").lower()
+    if req in ("", "auto"):
+        if dev == "cpu":
+            return "fp32"
+        return "bf16" if info.get("bf16") else "fp16"
     if req == "bf16":
         if dev in ("cuda", "xpu") and not info.get("bf16"):
             print("[提示] 当前 %s 显卡不支持 bf16，自动降级为 fp16" % dev.upper(), flush=True)
@@ -459,6 +478,8 @@ def device_label(active: Optional[str] = None) -> str:
     if key == "xpu":
         return f"XPU（{name or 'Intel Arc'}）"
     if key == "cuda":
+        if info.get("vendor") == "amd":
+            return f"AMD GPU（ROCm / {name or 'Radeon'}）"
         return f"CUDA（{name or 'NVIDIA'}）"
     return "CPU"
 
@@ -491,6 +512,18 @@ def _make_env() -> Dict[str, str]:
         env["PATH"] = str(FFMPEG_DIR) + os.pathsep + env.get("PATH", "")
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
+    cache = PROJECT_DIR / "vendor" / "sheetsage2"
+    env["HF_HOME"] = str(cache / ".hf_cache")
+    env["TORCH_HOME"] = str(cache / ".torch_cache")
+    env["NUMBA_CACHE_DIR"] = str(cache / ".numba_cache")
+    tmp_dir = PROJECT_DIR / "logs" / "tmp_wav"
+    try:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        env["TMP"] = str(tmp_dir)
+        env["TEMP"] = str(tmp_dir)
+    except OSError:
+        pass
+    env.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
     return env
 
 
@@ -852,6 +885,7 @@ def step2(
     chords: Optional[Union[str, Path]] = None,
     integrated: Optional[Union[str, Path]] = None,
     merge_mode: str = "duration",
+    stems: str = "both",
 ) -> Dict[str, Any]:
     """物理秒对齐 + 主旋律单音合并 + 和弦合并。"""
     t0 = time.time()
@@ -905,7 +939,13 @@ def step2(
         for cand in (out / "sheetsage2" / "chord.lab", out / "chord.lab"):
             if cand.is_file():
                 beat_cand = _first_existing(cand.parent, ("beat.lab",))
-                lab_slices = parse_chord_lab_to_slices(cand, beat_cand)
+                try:
+                    lab_slices = parse_chord_lab_to_slices(cand, beat_cand)
+                except Exception as exc:
+                    print(f"chord.lab 解析失败：{cand}（{exc}）")
+                    lab_slices = []
+                if not lab_slices:
+                    print(f"chord.lab 未解析出和弦切片：{cand}")
                 if lab_slices:
                     # 若用户手动指定了外部单轨文件，检查时长跨度是否属于同一首曲目（防跨歌串台）
                     if custom_external and slices:
@@ -917,6 +957,11 @@ def step2(
                     chord_notes = chord_slices_to_notes(slices)
                     lab_source = str(cand)
                 break
+
+    if stems == "vocal":
+        ins_notes = []
+    elif stems == "inst":
+        vocal_notes = []
 
     merged = merge_melodies(vocal_notes, ins_notes, merge_mode=merge_mode)
     melody_track = TrackNotes("Main Melody", merged)
@@ -1068,6 +1113,7 @@ def step3(
     out_dir: Union[str, Path],
     *,
     chords: Optional[Union[str, Path]] = None,
+    with_chords: bool = True,
     low: int = 40,
     high: int = 88,
     instrument_mode: str = "acoustic",
@@ -1084,8 +1130,10 @@ def step3(
     if melody_path is None or not Path(melody_path).is_file():
         raise FileNotFoundError(
             f"找不到主旋律文件：{melody_path}\n请先跑步骤 2，或用参数指定 main_melody.mid。")
-    chord_path = Path(chords) if chords else _first_existing(
-        out, ("chords_merged.mid", "chords.json"))
+    chord_path = None
+    if with_chords:
+        chord_path = Path(chords) if chords else _first_existing(
+            out, ("chords_merged.mid", "chords.json"))
 
     melody_tracks = _read_tracks(melody_path)
     melody_track = select_track(melody_tracks, ["Main Melody", "Melody"], fallback_all=True)
@@ -1119,7 +1167,10 @@ def step3(
     tempo = _detect_tempo_from_beats(out)
     if abs(tempo - 120.0) < 1e-9:
         tempo = _detect_tempo_from_beats(Path(melody_path).parent)
-    write_midi(final_path, [TrackNotes("Main Melody", fixed), chord_track], bpm=tempo)
+    tracks_out = [TrackNotes("Main Melody", fixed)]
+    if with_chords:
+        tracks_out.append(chord_track)
+    write_midi(final_path, tracks_out, bpm=tempo)
 
     result = {
         "step": 3,
@@ -1131,7 +1182,7 @@ def step3(
             "main_melody": len(fixed),
             "chord_slices": len(slices),
             "chord_pitches": count_chord_slice_pitches(slices),
-            "tracks": 2,
+            "tracks": 2 if with_chords else 1,
         },
         "pitch_range": [min((n.pitch for n in fixed), default=None),
                         max((n.pitch for n in fixed), default=None)],
@@ -1143,13 +1194,69 @@ def step3(
           f"音域 {result['pitch_range'][0]}~{result['pitch_range'][1]}"
           f"（{instrument_mode}，整轨 -{stats['global_down_octaves'] * 12} 半音，"
           f"孤立修正 {stats['isolated_fixed']}，单音折断 {stats['boundary_folded']}）；"
-          f"和弦 {len(slices)} 片 -> {final_path.name}")
+          + (f"和弦 {len(slices)} 片 -> {final_path.name}" if with_chords
+             else f"不输出和弦轨 -> {final_path.name}"))
     return result
 
 
 # ---------------------------------------------------------------------------
 # 一键全流程
 # ---------------------------------------------------------------------------
+def sep_runner_path() -> Path:
+    return Path(__file__).resolve().parent.parent / "vendor" / "sheetsage2" / "sep_runner.py"
+
+
+def run_sep_model(audio: Union[str, Path], temp_dir: Union[str, Path],
+                  base: str, sep_model: str = "htdemucs",
+                  log=None, timeout: float = 3600.0) -> Dict[str, Path]:
+    """调用 vendor 环境里的原生分离器，产出人声/乐器两条 WAV。"""
+    runner = sep_runner_path()
+    venv_py = (Path(__file__).resolve().parent.parent / "vendor" / "sheetsage2"
+               / ".venv" / "Scripts" / "python.exe")
+    if not runner.is_file() or not venv_py.is_file():
+        raise RuntimeError("未找到原生分离器或推理环境")
+    temp_dir = Path(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    vocal = temp_dir / ("人声轨-%s.wav" % base)
+    inst = temp_dir / ("乐器轨-%s.wav" % base)
+    cmd = [str(venv_py), str(runner), "--model", str(sep_model),
+           "--input", str(audio), "--out-vocal", str(vocal),
+           "--out-inst", str(inst)]
+    if log:
+        log("音源分离中（%s）…" % sep_model)
+    run_command(cmd, temp_dir / ("sep_%s.log" % sep_model), timeout=timeout)
+    if not vocal.is_file() or not inst.is_file():
+        raise RuntimeError("分离器未产出波形，请查看 out/temp_sep/sep_%s.log" % sep_model)
+    return {"vocal": vocal, "inst": inst}
+
+
+def render_notes_wav(notes, path: Union[str, Path], sr: int = 44100) -> Path:
+    """把音符渲染成单声道 16bit WAV（供分离试听）。"""
+    import math
+    import struct
+    import wave
+
+    notes = list(notes or [])
+    end = max((float(n.end_sec) for n in notes), default=0.0) + 0.5
+    buf = [0.0] * int(max(1.0, end) * sr)
+    for n in notes:
+        f0 = 440.0 * (2.0 ** ((int(n.pitch) - 69) / 12.0))
+        s0 = int(float(n.start_sec) * sr)
+        s1 = min(len(buf), int(float(n.end_sec) * sr))
+        for i in range(s0, s1):
+            t = (i - s0) / sr
+            env = math.exp(-t * 3.0) * min(1.0, t * 80.0)
+            buf[i] += 0.25 * env * math.sin(2.0 * math.pi * f0 * t)
+    peak = max((abs(v) for v in buf), default=0.0) or 1.0
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(b"".join(struct.pack("<h", int(max(-1.0, min(1.0, v / peak)) * 32000))
+                               for v in buf))
+    return Path(path)
+
+
 def run_all(
     audio: Union[str, Path],
     out_dir: Union[str, Path],
@@ -1162,6 +1269,9 @@ def run_all(
     instrument_mode: str = "acoustic",
     timeout: float = STEP_TIMEOUT,
     max_seconds: Optional[float] = None,
+    stems: str = "both",
+    sep_model: str = "native",
+    final_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """音频 -> 步骤 1 -> 步骤 2 -> 步骤 3，返回完整结果。"""
     t0 = time.time()
@@ -1175,12 +1285,57 @@ def run_all(
     print(f" 输出：{out}")
     print("=" * 66)
 
-    r1 = step1(audio, out, device=device, dtype=dtype, timeout=timeout,
+    base = Path(final_name).stem if final_name else audio.stem
+    prefix = "人声轨" if stems == "vocal" else "乐器轨"
+    temp_sep = None
+    input_audio = audio
+    shutil.rmtree(out / "temp_sep", ignore_errors=True)
+    if stems in ("vocal", "inst"):
+        temp_sep = out / "temp_sep"
+        temp_sep.mkdir(parents=True, exist_ok=True)
+        if str(sep_model) in ("htdemucs", "roformer"):
+            try:
+                stems_paths = run_sep_model(audio, temp_sep, base, sep_model, log=print)
+                input_audio = stems_paths["vocal" if stems == "vocal" else "inst"]
+            except Exception as exc:
+                if log:
+                    log("音源分离失败，回落内置双轨直出：%s" % exc)
+                print("音源分离失败，回落内置双轨直出：%s" % exc)
+                sep_model = "native"
+
+    r1 = step1(input_audio, out, device=device, dtype=dtype, timeout=timeout,
                max_seconds=max_seconds)
-    r2 = step2(out, merge_mode=merge_mode)
+
+    if temp_sep is not None and str(sep_model) not in ("htdemucs", "roformer"):
+        src = out / ("melody_vocal.mid" if stems == "vocal"
+                     else "melody_instrumental.mid")
+        if src.is_file():
+            shutil.copy2(src, temp_sep / src.name)
+            try:
+                tracks = _read_tracks(src)
+                render_notes_wav([n for t in tracks for n in t.notes],
+                                 temp_sep / ("%s-%s.wav" % (prefix, base)))
+            except Exception:
+                pass
+
+    r2 = step2(out, merge_mode=merge_mode, stems=stems)
+    if temp_sep is not None:
+        for name in ("main_melody.mid", "chords_merged.mid"):
+            path = out / name
+            if path.is_file():
+                shutil.copy2(path, temp_sep / name)
+
+    if stems in ("vocal", "inst"):
+        keep_name = "%s-%s.mid" % (prefix, base)
+    elif final_name:
+        keep_name = str(final_name)
+    else:
+        keep_name = "%s.mid" % base
     r3 = step3(out / "main_melody.mid", out,
-               chords=out / "chords_merged.mid", low=low, high=high,
-               instrument_mode=instrument_mode, source_audio=audio)
+               chords=out / "chords_merged.mid", with_chords=(stems != "vocal"),
+               low=low, high=high,
+               instrument_mode=instrument_mode, source_audio=audio,
+               final_name=keep_name)
 
     total = time.time() - t0
     summary = {
@@ -1208,9 +1363,10 @@ def run_all(
 # ---------------------------------------------------------------------------
 def _add_device_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--device", "-d", default=DEFAULT_DEVICE,
-                        choices=["auto", "xpu", "cuda", "cpu"], help="推理设备")
-    parser.add_argument("--dtype", default=DEFAULT_DTYPE,
-                        choices=["bf16", "fp16", "fp32"], help="推理精度")
+                        choices=["auto", "xpu", "cuda", "amd", "rocm", "cpu"],
+                        help="推理设备")
+    parser.add_argument("--dtype", default="auto",
+                        choices=["auto", "bf16", "fp16", "fp32"], help="推理精度")
 
 
 def build_parser() -> argparse.ArgumentParser:

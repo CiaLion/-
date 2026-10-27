@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import traceback
@@ -170,8 +171,12 @@ class MainWindow(QMainWindow):
 
         self.worker = None
         self.probe = None
+        self._sep_pct = 0
+        self._sep_active = False
+
         self.results = {1: None, 2: None, 3: None}
         self._run_t0 = 0.0
+        self._stage_t0 = 0.0
         self._run_label = ""
         self._run_stage_pct = 0
         self._run_stage_text = ""
@@ -183,7 +188,7 @@ class MainWindow(QMainWindow):
         self._prog_timer = QTimer(self)
         self._prog_timer.setInterval(200)
         self._prog_timer.timeout.connect(self._tick_transcribe_progress)
-        self.log("《异键演奏》已就绪。请先选择原始音频，然后点击「▶ 一键全流程智能扒谱」。")
+        self.log("就绪：选择音频文件后点击「开始扒谱」。")
         self.log(f"配置文件：{pipeline.config_file()}")
 
     # ------------------------------------------------------------------ UI
@@ -221,84 +226,87 @@ class MainWindow(QMainWindow):
         v.setContentsMargins(14, 12, 14, 12)
         v.setSpacing(7)
 
-        title = QLabel("① 音源输入与全局扒谱参数")
+        title = QLabel("音频转 MIDI（AI 智能扒谱）")
         title.setObjectName("cardtitle")
         v.addWidget(title)
 
         self.s1_audio = QLineEdit()
         self.s1_audio.setPlaceholderText("选择 mp3 / wav / flac / m4a 音频")
-        self._field(v, "原始音频", self.s1_audio, "file", AUDIO_FILTER, "选择原始音频")
-
-        row_out = QHBoxLayout()
-        row_out.setSpacing(8)
-        row_out.addWidget(self._mini_label("输出目录"))
-        self.s1_out = QLineEdit()
-        self.s1_out.setPlaceholderText("所有步骤共用这个输出目录")
-        row_out.addWidget(self.s1_out, 1)
-        btn_out = QPushButton("浏览…")
-        btn_out.setObjectName("ghost")
-        btn_out.setFixedWidth(72)
-        btn_out.clicked.connect(lambda: self._browse(self.s1_out, "dir", "", "选择输出目录"))
-        row_out.addWidget(btn_out)
-        row_out.addWidget(self._mini_label("成品文件名", 78))
+        row_audio = QHBoxLayout()
+        row_audio.setSpacing(8)
+        row_audio.addWidget(self._mini_label("原始音频", 84))
+        row_audio.addWidget(self.s1_audio, 1)
+        row_audio.addWidget(self._mini_label("成品文件名", 78))
         self.s3_name = QLineEdit()
         self.s3_name.setPlaceholderText("留空 = 与音频同名")
         self.s3_name.setFixedWidth(190)
-        row_out.addWidget(self.s3_name)
-        v.addLayout(row_out)
+        row_audio.addWidget(self.s3_name)
+        btn_audio = QPushButton("浏览…")
+        btn_audio.setObjectName("ghost")
+        btn_audio.setFixedWidth(72)
+        btn_audio.clicked.connect(lambda: self._browse(self.s1_audio, "file", AUDIO_FILTER, "选择原始音频"))
+        row_audio.addWidget(btn_audio)
+        v.addLayout(row_audio)
+
+        self.s1_out = QLineEdit(card)
+        self.s1_out.setText("out")
+        self.s1_out.setVisible(False)
         self.s1_out.textChanged.connect(self._sync_out_dirs)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(8)
-        # 5 个核心参数 = 规整 2×2 + 1 栅格，左侧标签统一 84px
         grid.addWidget(self._mini_label("推理设备", 84), 0, 0)
         box_dev = QHBoxLayout()
         box_dev.setSpacing(8)
         self.device_combo = QComboBox()
         self.device_combo.addItems(["自动检测", "XPU（Intel Arc）", "CUDA（NVIDIA）",
-                                    "CPU"])
+                                    "ROCm（AMD）", "CPU"])
         self.device_combo.setMinimumWidth(190)
         box_dev.addWidget(self.device_combo, 1)
         self.device_state = QLabel("正在探测设备…")
         self.device_state.setObjectName("dev")
         box_dev.addWidget(self.device_state, 2)
-        grid.addLayout(box_dev, 0, 1)
-        grid.addWidget(self._mini_label("推理精度", 84), 0, 2)
-        self.s1_dtype = QComboBox()
-        self.s1_dtype.addItems(["bf16（推荐）", "fp16", "fp32"])
-        self.s1_dtype.setMinimumWidth(150)
-        grid.addWidget(self.s1_dtype, 0, 3)
+        grid.addLayout(box_dev, 0, 1, 1, 3)
 
         grid.addWidget(self._mini_label("音色适配", 84), 1, 0)
         self.s3_instrument = QComboBox()
         self.s3_instrument.addItem("电吉他模式", "electric")
         self.s3_instrument.addItem("木吉他模式", "acoustic")
         self.s3_instrument.setMinimumWidth(150)
-        grid.addWidget(self.s3_instrument, 1, 1)
+        grid.addWidget(self.s3_instrument, 1, 1, 1, 3)
 
-        grid.addWidget(self._mini_label("有效音域", 84), 1, 2)
-        row_range = QHBoxLayout()
-        row_range.setSpacing(8)
-        self.s3_low = QSpinBox()
+        self.s3_low = QSpinBox(card)
         self.s3_low.setRange(0, 127)
         self.s3_low.setValue(40)
-        self.s3_low.setFixedWidth(70)
-        self.s3_high = QSpinBox()
+        self.s3_low.setVisible(False)
+        self.s3_high = QSpinBox(card)
         self.s3_high.setRange(0, 127)
         self.s3_high.setValue(88)
-        self.s3_high.setFixedWidth(70)
-        row_range.addWidget(self.s3_low)
-        sep = QLabel("~")
-        sep.setAlignment(Qt.AlignCenter)
-        sep.setMinimumWidth(20)
-        row_range.addWidget(sep)
-        row_range.addWidget(self.s3_high)
-        hint_range = QLabel("E2 ~ E6")
-        hint_range.setObjectName("sub")
-        row_range.addWidget(hint_range)
-        row_range.addStretch(1)
-        grid.addLayout(row_range, 1, 3)
+        self.s3_high.setVisible(False)
+
+        grid.addWidget(self._mini_label("扒谱声部", 84), 2, 0)
+        row_stem = QHBoxLayout()
+        row_stem.setSpacing(12)
+        self.chk_vocal = QCheckBox("人声主旋律")
+        self.chk_inst = QCheckBox("器乐旋律")
+        for _cb in (self.chk_vocal, self.chk_inst):
+            _cb.setChecked(True)
+            _cb.toggled.connect(self._on_stem_toggled)
+            row_stem.addWidget(_cb)
+        self.cmb_sep_model = QComboBox()
+        self.cmb_sep_model.addItem("内置双轨直出（免额外模型，最快）", "native")
+        self.cmb_sep_model.addItem("HT-Demucs 极速分离 (约319MB，原生免装包)", "htdemucs")
+        self.cmb_sep_model.addItem("Mel-Band RoFormer 高精分离 (约871MB，最高音质)", "roformer")
+        self.cmb_sep_model.setMinimumWidth(280)
+        self.cmb_sep_model.setEnabled(False)
+        row_stem.addWidget(self.cmb_sep_model)
+        self.btn_open_sep = QPushButton("打开分离音频所在目录")
+        self.btn_open_sep.setObjectName("ghost")
+        self.btn_open_sep.clicked.connect(self._open_temp_sep)
+        row_stem.addWidget(self.btn_open_sep)
+        row_stem.addStretch(1)
+        grid.addLayout(row_stem, 2, 1, 1, 3)
 
         # 单模型管线固定按“时长更长优先”合并；控件保留但不显示，兼容旧设置
         self.s2_mode = QComboBox()
@@ -355,7 +363,7 @@ class MainWindow(QMainWindow):
 
         row_btns = QHBoxLayout()
         row_btns.setSpacing(8)
-        self.btn_run_all = QPushButton("▶ 一键全流程智能扒谱")
+        self.btn_run_all = QPushButton("▶ 开始扒谱")
         self.btn_run_all.setObjectName("primary")
         self.btn_run_all.setMinimumHeight(38)
         self.btn_run_all.clicked.connect(self._run_all)
@@ -375,6 +383,7 @@ class MainWindow(QMainWindow):
         row_btns.addWidget(self.btn_roll_final)
         row_btns.addStretch(1)
         self.chk_auto_send = QCheckBox("完成后自动送入演奏台")
+        self.chk_auto_send.setVisible(False)
         row_btns.addWidget(self.chk_auto_send)
         self.btn_send = QPushButton("送入演奏台")
         self.btn_send.clicked.connect(self.sendRequested.emit)
@@ -386,7 +395,7 @@ class MainWindow(QMainWindow):
         self.transcribe_bar.setRange(0, 100)
         self.transcribe_bar.setValue(0)
         self.transcribe_bar.setTextVisible(True)
-        self.transcribe_bar.setFormat("就绪 — 选择音频后点击「▶ 一键全流程智能扒谱」")
+        self.transcribe_bar.setFormat("就绪 — 选择音频文件后点击「开始扒谱」")
         v.addWidget(self.transcribe_bar)
         return card
 
@@ -530,12 +539,12 @@ class MainWindow(QMainWindow):
             edit.setText(path)
 
     def _device_key(self) -> str:
-        return {0: "auto", 1: "xpu", 2: "cuda", 3: "cpu"}.get(
+        return {0: "auto", 1: "xpu", 2: "cuda", 3: "amd", 4: "cpu"}.get(
             self.device_combo.currentIndex(), "auto")
 
     def _dtype_key(self) -> str:
-        return {0: "bf16", 1: "fp16", 2: "fp32"}.get(
-            self.s1_dtype.currentIndex(), "bf16")
+        # 精度不再手选：按设备能力自动分配（bf16 / fp16 / fp32）
+        return "auto"
 
     def _merge_key(self) -> str:
         # 单模型管线：人声与器乐轨固定按时长更长优先合并
@@ -548,9 +557,12 @@ class MainWindow(QMainWindow):
 
     def _on_probe(self, info: dict) -> None:
         best = (info.get("best") or "cpu").lower()
+        vendor = (info.get("vendor") or "").lower()
         name = info.get("name") or ""
         if best == "xpu":
             self.device_state.setText(f"当前可用：{name or 'Intel Arc'}（XPU 加速）")
+        elif best == "cuda" and vendor == "amd":
+            self.device_state.setText(f"当前可用：{name or 'AMD GPU'}（ROCm 加速）")
         elif best == "cuda":
             self.device_state.setText(f"当前可用：{name or 'NVIDIA'}（CUDA 加速）")
         else:
@@ -569,7 +581,7 @@ class MainWindow(QMainWindow):
                 btn.setEnabled(not running)
             except Exception:
                 pass
-        for w in (self.device_combo, self.s1_dtype, self.s2_mode,
+        for w in (self.device_combo, self.s2_mode,
                   self.s3_instrument, self.s3_low, self.s3_high):
             try:
                 w.setEnabled(not running)
@@ -587,15 +599,25 @@ class MainWindow(QMainWindow):
         if self.worker is None or not self.worker.isRunning():
             return
         elapsed = max(0.0, time.time() - self._run_t0)
+        if self._sep_active:
+            # 分离占 3%~35%
+            pct = min(35, max(self._run_stage_pct, 3 + int(0.32 * self._sep_pct)))
+            self._run_stage_pct = pct
+            self._update_transcribe_bar(
+                pct,
+                f"正在分离人声与伴奏… ({self._sep_pct}%) · 已用时 {elapsed:.1f}s")
+            self.s1_status.setText(f"分离中… ({self._sep_pct}% · {elapsed:.1f}s)")
+            return
         # 在步骤 ① 耗时推理期间，使用渐近曲线平滑推进进度条（不卡死，也不提前到 90%）
         if self._active_step in (0, 1) and self._run_stage_pct < 86:
-            if elapsed < 8.0 and self._run_stage_pct < 18:
-                pct = max(self._run_stage_pct, min(18, 3 + int(elapsed * 1.9)))
+            est = max(0.0, time.time() - (self._stage_t0 or self._run_t0))
+            if est < 8.0 and self._run_stage_pct < 18:
+                pct = max(self._run_stage_pct, min(18, 3 + int(est * 1.9)))
                 stage = self._run_stage_text or "正在加载 AI 模型至显卡与初始化音频特征"
             else:
                 # 8s 之后从 18% 渐近推进到 85%（时间常数 32s，兼容短歌与 4 分钟长歌）
                 import math
-                asym = 18 + int(67.0 * (1.0 - math.exp(-max(0.0, elapsed - 8.0) / 32.0)))
+                asym = 18 + int(67.0 * (1.0 - math.exp(-max(0.0, est - 8.0) / 32.0)))
                 pct = max(self._run_stage_pct, min(85, asym))
                 stage = self._run_stage_text or "正在执行步骤 ①：SheetSage2 音频智能转录"
             self._run_stage_pct = pct
@@ -612,13 +634,17 @@ class MainWindow(QMainWindow):
         elif self._active_step == 3 or (self._active_step == 0 and pct >= 95):
             self.s3_status.setText(f"运行中… ({pct}% · {elapsed:.1f}s)")
 
-    def _run(self, fn, on_done, label: str, step_idx: int = 0) -> None:
+    def _run(self, fn, on_done, label: str, step_idx: int = 0,
+             sep_active: bool = False) -> None:
         if self.worker is not None and self.worker.isRunning():
             self.log("× 还有任务在跑，先等它结束或点「停止」。")
             return
         self._run_t0 = time.time()
+        self._stage_t0 = self._run_t0
         self._run_label = label
         self._active_step = step_idx
+        self._sep_pct = 0
+        self._sep_active = bool(sep_active)
         if step_idx in (0, 1):
             self._run_stage_pct = 3
             self._run_stage_text = "正在启动 AI 音频转录管线"
@@ -647,6 +673,17 @@ class MainWindow(QMainWindow):
                 s = line.strip()
                 if not s:
                     continue
+                if s.startswith("[分离进度]"):
+                    m_sep = re.search(r"(\d{1,3})\s*%", s)
+                    if m_sep:
+                        self._sep_pct = min(100, max(0, int(m_sep.group(1))))
+                        self._sep_active = True
+                        self._run_stage_pct = max(
+                            self._run_stage_pct, min(32, 3 + int(0.29 * self._sep_pct)))
+                    continue
+                if "[步骤1/3]" in s:
+                    self._sep_active = False
+                    self._stage_t0 = time.time()
                 if "加载" in s or "loading" in s.lower() or "merge_lora" in s.lower():
                     self._run_stage_pct = max(self._run_stage_pct, 12)
                     self._run_stage_text = "正在加载 SheetSage2 与 MERT 模型权重"
@@ -706,9 +743,7 @@ class MainWindow(QMainWindow):
         legacy_audio = data.get("audio") or ""
         legacy_out = data.get("outdir") or ""
         self.s1_audio.setText(str(s1.get("audio") or legacy_audio))
-        self.s1_out.setText(_out_display(s1.get("outdir") or legacy_out or "out"))
-        self.s1_dtype.setCurrentIndex({"bf16": 0, "fp16": 1, "fp32": 2}.get(
-            str(s1.get("dtype")), 0))
+        self.s1_out.setText("out")
         self.s2_vocal.setText(str(s2.get("vocal") or ""))
         self.s2_ins.setText(str(s2.get("instrumental") or ""))
         self.s2_chords.setText(str(s2.get("chords") or ""))
@@ -729,7 +764,12 @@ class MainWindow(QMainWindow):
                 else str(s3.get("instrument_mode") or "electric"))
         pos = self.s3_instrument.findData(mode)
         self.s3_instrument.setCurrentIndex(pos if pos >= 0 else 0)
-        idx = {"auto": 0, "xpu": 1, "cuda": 2, "cpu": 3}.get(
+        self.chk_vocal.setChecked(bool(s3.get("stem_vocal", True)))
+        self.chk_inst.setChecked(bool(s3.get("stem_inst", True)))
+        _sep = self.cmb_sep_model.findData(s3.get("sep_model") or "native")
+        self.cmb_sep_model.setCurrentIndex(_sep if _sep >= 0 else 0)
+        self.cmb_sep_model.setEnabled(self._stems() != "both")
+        idx = {"auto": 0, "xpu": 1, "cuda": 2, "amd": 3, "rocm": 3, "cpu": 4}.get(
             str(data.get("device")), 0)
         self.device_combo.setCurrentIndex(idx)
         win = data.get("window") or {}
@@ -760,7 +800,10 @@ class MainWindow(QMainWindow):
                       "outdir": _out_store(self.s3_out.text()),
                       "name": self.s3_name.text().strip(),
                       "low": self.s3_low.value(), "high": self.s3_high.value(),
-            "instrument_mode": self.s3_instrument.currentData()},
+                      "instrument_mode": self.s3_instrument.currentData(),
+                      "stem_vocal": self.chk_vocal.isChecked(),
+                      "stem_inst": self.chk_inst.isChecked(),
+                      "sep_model": self.cmb_sep_model.currentData()},
             "window": {"size": [self.width(), self.height()]},
         }
         try:
@@ -801,6 +844,47 @@ class MainWindow(QMainWindow):
                 win.show_env_check()
         return False
 
+    def _open_temp_sep(self):
+        base = str(_resolve_out(self.s1_out.text()) or "out")
+        path = os.path.join(base, "temp_sep")
+        if not os.path.isdir(path):
+            QMessageBox.information(
+                self, "还没有分离音频",
+                "先单选「人声主旋律」或「器乐旋律」跑一次扒谱，\n"
+                "分离出的人声/器乐 WAV 会放在：\n%s" % path)
+            return
+        newest = ""
+        try:
+            wavs = [os.path.join(path, n) for n in os.listdir(path)
+                    if n.lower().endswith((".wav", ".flac", ".mp3"))]
+            if wavs:
+                newest = max(wavs, key=os.path.getmtime)
+        except Exception:  # noqa: BLE001
+            newest = ""
+        try:
+            if newest:
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(newest)])
+            else:
+                os.startfile(path)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "打不开目录", str(exc))
+
+    def _on_stem_toggled(self, _checked=None):
+        if hasattr(self, "cmb_sep_model"):
+            self.cmb_sep_model.setEnabled(self._stems() != "both")
+        if not self.chk_vocal.isChecked() and not self.chk_inst.isChecked():
+            other = (self.chk_inst if self.sender() is self.chk_vocal
+                     else self.chk_vocal)
+            other.blockSignals(True)
+            other.setChecked(True)
+            other.blockSignals(False)
+
+    def _stems(self):
+        v, i = self.chk_vocal.isChecked(), self.chk_inst.isChecked()
+        if v and i:
+            return "both"
+        return "vocal" if v else "inst"
+
     def _run_all(self) -> None:
         if not self._ensure_ai_or_prompt():
             return
@@ -825,11 +909,19 @@ class MainWindow(QMainWindow):
         for label in (self.s1_status, self.s2_status, self.s3_status):
             label.setText("运行中…")
 
+        stems = self._stems()
+        sep = self.cmb_sep_model.currentData() or "native"
+        if stems == "both":
+            sep = "native"
+        will_sep = sep in ("htdemucs", "roformer")
+
         def job():
             return pipeline.run_all(audio, out, device=self._device_key(),
                                     dtype=self._dtype_key(), merge_mode=self._merge_key(),
                                     low=low, high=high,
-                                    instrument_mode=self.s3_instrument.currentData())
+                                    instrument_mode=self.s3_instrument.currentData(),
+                                    stems=stems, sep_model=sep,
+                                    final_name=self.s3_name.text().strip() or None)
 
         def done(summary):
             steps = summary.get("steps") or []
@@ -845,7 +937,7 @@ class MainWindow(QMainWindow):
             if final:
                 self.sig_all_done.emit(str(final))
 
-        self._run(job, done, "一键全流程", step_idx=0)
+        self._run(job, done, "一键全流程", step_idx=0, sep_active=will_sep)
 
     def _run_step1(self) -> None:
         if not self._ensure_ai_or_prompt():
@@ -884,6 +976,7 @@ class MainWindow(QMainWindow):
 
         def job():
             return pipeline.step2(out, vocal=vocal, instrumental=ins,
+                                  stems=self._stems(),
                                   chords=chords, integrated=integrated,
                                   merge_mode=self._merge_key())
 

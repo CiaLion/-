@@ -24,7 +24,10 @@ MERT_DIR = WEBUI_ROOT / "models" / "MERT-v2-FullSong"
 LOCAL_HF_CACHE = WEBUI_ROOT / ".hf_cache"
 os.environ["HF_HOME"] = str(LOCAL_HF_CACHE)
 os.environ["HF_MODULES_CACHE"] = str(LOCAL_HF_CACHE / "modules")
+os.environ["TORCH_HOME"] = str(WEBUI_ROOT / ".torch_cache")
+os.environ["NUMBA_CACHE_DIR"] = str(WEBUI_ROOT / ".numba_cache")
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+os.environ.setdefault("TRANSFORMERS_NO_TORCHVISION", "1")
 
 sys.path.insert(0, str(SHEETSAGE2_DIR))
 sys.path.insert(0, str(WEBUI_ROOT))
@@ -164,7 +167,7 @@ def main():
     parser.add_argument("audio", type=Path, help="输入音频路径 (wav, mp3, flac 等)")
     parser.add_argument("--output", "-o", type=Path, default=Path("output"), help="输出目录")
     parser.add_argument("--device", "-d", default="xpu",
-                        choices=["xpu", "cuda", "cpu"],
+                        choices=["auto", "xpu", "cuda", "amd", "rocm", "cpu"],
                         help="推理设备")
     parser.add_argument("--dtype", default="bf16",
                         choices=["bf16", "fp16", "fp32"], help="推理精度")
@@ -185,12 +188,40 @@ def main():
     print(f" 输出目录: {out_dir}")
     print("=" * 65)
 
-    device = args.device
-    if device == "xpu" and not (hasattr(torch, "xpu") and torch.xpu.is_available()):
-        print("[警告] XPU 不可用，回退至 CPU 推理")
-        device = "cpu"
-    if device == "cuda" and not torch.cuda.is_available():
-        print("[警告] CUDA 不可用，回退至 CPU 推理")
+    req_device = str(args.device).strip().lower()
+    if req_device in ("auto", ""):
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            device = "xpu"
+        elif torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+    elif req_device in ("amd", "rocm"):
+        if torch.cuda.is_available():
+            device = "cuda"
+            is_hip = hasattr(torch.version, "hip") and torch.version.hip is not None
+            dname = ""
+            try:
+                dname = torch.cuda.get_device_name(0)
+            except Exception:
+                pass
+            print(f"[提示] 已挂载 AMD ROCm/CUDA 设备: {dname or 'AMD GPU'}")
+        else:
+            print("[警告] 请求了 AMD (ROCm) 设备，但当前 PyTorch 未检测到可用 GPU，自动安全回退至 CPU 推理")
+            device = "cpu"
+    elif req_device == "xpu":
+        if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
+            print("[警告] XPU 不可用，自动安全回退至 CPU 推理")
+            device = "cpu"
+        else:
+            device = "xpu"
+    elif req_device == "cuda":
+        if not torch.cuda.is_available():
+            print("[警告] CUDA/ROCm 不可用，自动安全回退至 CPU 推理")
+            device = "cpu"
+        else:
+            device = "cuda"
+    else:
         device = "cpu"
     # ---- 硬件动态路由：注意力与精度都不写死成某一家显卡 ----
     device_kind = device
@@ -280,10 +311,37 @@ def main():
         result = model.transcribe(str(audio_path), output_dir=out_dir,
                                   progress=make_progress_printer(), **options)
     except Exception as e:
-        print(f"[错误] 转录过程中发生异常: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        if device != "cpu":
+            print(f"[警告] 设备 [{device.upper()}] 推理异常 ({e})，正在自动安全回退至 CPU 重新执行...")
+            try:
+                del model
+            except Exception:
+                pass
+            import gc
+            gc.collect()
+            try:
+                if device == "cuda" and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif device == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+                    torch.xpu.empty_cache()
+            except Exception:
+                pass
+
+            cpu_model = AutoModel.from_pretrained(
+                sheetsage_path,
+                config=model_config,
+                base_model_path=mert_path,
+                trust_remote_code=True,
+                local_files_only=True,
+            ).eval().to("cpu")
+            options["dtype"] = "fp32"
+            result = cpu_model.transcribe(str(audio_path), output_dir=out_dir,
+                                          progress=make_progress_printer(), **options)
+        else:
+            print(f"[错误] 转录过程中发生异常: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
 
     print("[3/3] 转录完成！已生成核心资产:")
     expected_files = [

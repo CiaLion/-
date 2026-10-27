@@ -3,8 +3,8 @@
 The goal is one model code path that is fast on every machine and never
 assumes a particular GPU vendor:
 
-* attention:  CUDA sm_80+ -> "sdpa"; XPU / CPU / older CUDA -> "eager"
-* precision:  XPU -> bf16; CUDA (bf16 capable) -> bf16; old CUDA -> fp16;
+* attention:  CUDA sm_80+ -> "sdpa"; XPU / CPU / older CUDA / AMD -> "eager"
+* precision:  XPU -> bf16; CUDA/AMD (bf16 capable) -> bf16; old CUDA/AMD -> fp16;
               CPU -> fp32
 
 Only the pure decision functions live here (no torch import at module level)
@@ -13,9 +13,9 @@ so the release gate can unit-test every branch on any host.
 
 
 def normalize_device_type(device_type):
-    """Map torch device types / user labels to the three routing buckets."""
+    """Map torch device types / user labels to the routing buckets."""
     value = str(device_type or "").strip().lower()
-    if value in ("cuda", "gpu", "nvidia"):
+    if value in ("cuda", "gpu", "nvidia", "amd", "rocm", "radeon"):
         return "cuda"
     if value in ("xpu", "intel"):
         return "xpu"
@@ -56,15 +56,27 @@ def select_dtype(device_type, cuda_major=None, bf16_supported=None):
 def detect_routing():
     """Probe the current process and return a routing dict.
 
-    Returns ``{device_type, cuda_major, bf16_supported, attention, dtype}``.
+    Returns ``{device_type, cuda_major, bf16_supported, vendor, attention, dtype}``.
     Safe to call on machines without torch (returns CPU routing).
     """
     device_type, cuda_major, bf16_supported = "cpu", None, None
+    vendor = "cpu"
     try:
         import torch
 
         if torch.cuda.is_available():
             device_type = "cuda"
+            is_hip = hasattr(torch.version, "hip") and torch.version.hip is not None
+            dev_name = ""
+            try:
+                dev_name = torch.cuda.get_device_name(0).lower()
+            except Exception:
+                pass
+            if is_hip or "amd" in dev_name or "radeon" in dev_name:
+                vendor = "amd"
+            else:
+                vendor = "nvidia"
+
             try:
                 cuda_major = int(torch.cuda.get_device_capability(0)[0])
             except Exception:
@@ -75,6 +87,7 @@ def detect_routing():
                 bf16_supported = None
         elif hasattr(torch, "xpu") and torch.xpu.is_available():
             device_type = "xpu"
+            vendor = "intel"
             try:
                 bf16_supported = bool(torch.xpu.is_bf16_supported())
             except Exception:
@@ -85,6 +98,7 @@ def detect_routing():
         "device_type": device_type,
         "cuda_major": cuda_major,
         "bf16_supported": bf16_supported,
+        "vendor": vendor,
         "attention": select_attention(device_type, cuda_major),
         "dtype": select_dtype(device_type, cuda_major, bf16_supported),
     }

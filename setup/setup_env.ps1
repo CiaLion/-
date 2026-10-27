@@ -1,4 +1,4 @@
-﻿# setup_env.ps1 -- create / verify the two Python virtual environments.
+# setup_env.ps1 -- create / verify the two Python virtual environments.
 #
 #   .venv                          main program  (main.py, gui_main.py, player, transcriber)
 #   vendor\sheetsage2\.venv        SheetSage2    (torch + transformers + librosa + imageio-ffmpeg)
@@ -7,7 +7,7 @@
 
 [CmdletBinding()]
 param(
-    [ValidateSet('auto', 'xpu', 'cuda', 'cpu')]
+    [ValidateSet('auto', 'xpu', 'cuda', 'rocm', 'cpu')]
     [string]$Backend = 'auto',
     [string]$TorchIndex = '',
     [switch]$Check,
@@ -30,7 +30,9 @@ $MainVenv = Join-Path $Root '.venv'
 $S2Venv   = Join-Path $Root 'vendor\sheetsage2\.venv'
 $MainReq  = Join-Path $Root 'requirements.txt'
 $S2Req    = Join-Path $Root 'vendor\sheetsage2\requirements-base.txt'
+$S2SepReq = Join-Path $Root 'vendor\sheetsage2\requirements-sep.txt'
 $script:CudaMajor  = 0
+$script:RocmRepo   = 'https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/'
 $script:PyPIMirror = $null
 $script:SavedProxy = $null
 $script:TorchHint  = [regex]::Unescape('[\u63d0\u793a] \u6b63\u5728\u4ece\u56fd\u5185\u9ad8\u901f\u955c\u50cf\u4e0b\u8f7d\u663e\u5361\u63a8\u7406\u6838\u5fc3 (\u7ea6 2.4 GB)\uff0c\u8bf7\u52ff\u7528\u9f20\u6807\u5de6\u952e\u70b9\u51fb\u9ed1\u6846\u5185\u90e8...')
@@ -181,7 +183,19 @@ function Get-TorchSubdir([string]$Which) {
     switch ($Which) {
         'cuda' { if ($script:CudaMajor -ge 10) { return 'cu128' } else { return 'cu121' } }
         'xpu'  { return 'xpu' }
+        'rocm' { return 'rocm' }
         default { return 'cpu' }
+    }
+}
+
+# ROCm wheels on Windows are published for Python 3.12 only, so the AI venv
+# interpreter decides whether the AMD GPU can be used.
+function Get-PythonMinorVersion([string]$Py) {
+    try {
+        $out = & $Py -E -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
+        return ([string]$out).Trim()
+    } catch {
+        return ''
     }
 }
 
@@ -271,9 +285,9 @@ function Get-NvidiaComputeMajor {
 function Select-Backend([string]$Adapters, [bool]$NvidiaSmi, [bool]$ZeLoader) {
     if ($Adapters -match 'NVIDIA|GeForce|Quadro|Tesla' -or $NvidiaSmi) { return 'cuda' }
     if ($Adapters -match 'Intel.*Arc|Arc\(TM\)') { return 'xpu' }
-    # AMD cards run on the CPU. GPU acceleration is only offered for NVIDIA
-    # (CUDA) and Intel Arc (XPU), which are the two backends this build ships.
-    if ($Adapters -match 'AMD|Radeon') { return 'cpu' }
+    # AMD cards go through ROCm. Windows wheels only exist for Python 3.12,
+    # so Install-Torch checks the venv interpreter and falls back to CPU.
+    if ($Adapters -match 'AMD|Radeon') { return 'rocm' }
     return 'cpu'
 }
 
@@ -306,6 +320,9 @@ function Detect-Backend {
             Write-Host ('  [gpu] no discrete GPU detected: ' + $physJoined)
         }
         Write-LogLine ('[gpu] backend=cpu adapters=' + $physJoined)
+    } elseif ($which -eq 'rocm') {
+        Write-Host ('  [gpu] AMD detected: ' + $physJoined + ' -> ROCm (Python 3.12 required)')
+        Write-LogLine ('[gpu] backend=rocm adapters=' + $physJoined)
     } else {
         Write-Host ('  [gpu] ' + $which + ' detected: ' + $physJoined)
         Write-LogLine ('[gpu] backend=' + $which + ' adapters=' + $physJoined)
@@ -321,6 +338,7 @@ function Get-TorchIndex([string]$Which) {
             if ($script:CudaMajor -ge 10) { return 'https://download.pytorch.org/whl/cu128' }
             return 'https://download.pytorch.org/whl/cu121'
         }
+        'rocm' { return $script:RocmRepo }
         default { return 'https://download.pytorch.org/whl/cpu' }
     }
 }
@@ -476,15 +494,18 @@ function Test-S2BackendReady([string]$VenvPython, [string]$Which) {
     }
     if ($Which -eq 'cuda') {
         $code = 'import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)'
+    } elseif ($Which -eq 'rocm') {
+        $code = "import sys, torch; sys.exit(0 if (torch.cuda.is_available() and getattr(torch.version, 'hip', None)) else 1)"
     } elseif ($Which -eq 'xpu') {
-        $code = 'import sys, torch; sys.exit(0 if (hasattr(torch, "xpu") and torch.xpu.is_available()) else 1)'
+        $code = "import sys, torch; sys.exit(0 if (hasattr(torch, 'xpu') and torch.xpu.is_available()) else 1)"
     } else {
         return $true
     }
     $oldEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
     try {
-        $null = & $VenvPython -E -c $code 2>&1
+        $out = & $VenvPython -E -c $code 2>&1
+        if ($LASTEXITCODE -ne 0) { Write-LogLine ('[probe-fail] ' + $Which + ': ' + ($out -join ' ')) }
         return ($LASTEXITCODE -eq 0)
     } catch {
         return $false
@@ -498,16 +519,45 @@ function Install-Torch([string]$VenvPython, [string]$Which, [string]$Label) {
     switch ($Which) {
         'cuda' {
             if ($script:CudaMajor -ge 10) {
-                $packages = @('torch==2.7.0+cu128', 'torchvision==0.22.0+cu128', 'torchaudio==2.7.0+cu128')
+                $packages = @('torch==2.7.0+cu128', 'torchaudio==2.7.0+cu128', 'torchvision==0.22.0+cu128')
             } else {
-                $packages = @('torch==2.5.1+cu121', 'torchvision==0.20.1+cu121', 'torchaudio==2.5.1+cu121')
+                $packages = @('torch==2.5.1+cu121', 'torchaudio==2.5.1+cu121', 'torchvision==0.20.1+cu121')
             }
         }
         'xpu' {
-            $packages = @('torch==2.7.0+xpu', 'torchaudio==2.7.0+xpu')
+            $packages = @('torch==2.7.0+xpu', 'torchaudio==2.7.0+xpu', 'torchvision==0.22.0+xpu')
+        }
+        'rocm' {
+            $pyver = Get-PythonMinorVersion $VenvPython
+            Write-LogLine ('[torch] rocm request, venv python=' + $pyver)
+            if ($pyver -eq '3.12') {
+                $repo = $script:RocmRepo
+                $packages = @(
+                    ($repo + 'rocm_sdk_core-7.2.1-py3-none-win_amd64.whl'),
+                    ($repo + 'rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl'),
+                    ($repo + 'rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl'),
+                    ($repo + 'torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl'),
+                    ($repo + 'torchaudio-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl'),
+                    ($repo + 'torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl')
+                )
+                Write-Host '  AMD ROCm 7.2.1 (Windows): installing ROCm SDK + torch/torchaudio/torchvision'
+                Write-Host '  (~2.5 GB download, AMD driver 26.2.2 or newer required)'
+                Write-Host $script:TorchHint -ForegroundColor Yellow
+                Invoke-Py $VenvPython (@('-m', 'pip', 'install', '--no-cache-dir',
+                    '--progress-bar', 'on', '--disable-pip-version-check') + $packages)
+                Write-Ok 'torch installed (rocm 7.2.1)'
+                return
+            }
+            Write-Warn2 ('AMD ROCm wheels for Windows exist only for Python 3.12; this venv is ' + $pyver + '.')
+            Write-Host '  -> installing the CPU build so transcription still works.'
+            Write-Host '  -> for AMD GPU speed, rebuild the AI venv with Python 3.12, then run:'
+            Write-Host '       setup\setup_env.ps1 -Backend rocm'
+            Write-LogLine ('[torch] rocm unavailable on python ' + $pyver + ' -> cpu fallback')
+            $Which = 'cpu'
+            $packages = @('torch==2.5.1+cpu', 'torchaudio==2.5.1+cpu')
         }
         default {
-            $packages = @('torch==2.5.1+cpu', 'torchaudio==2.5.1+cpu')
+            $packages = @('torch==2.5.1+cpu', 'torchvision==0.20.1+cpu', 'torchaudio==2.5.1+cpu')
         }
     }
 
@@ -609,7 +659,7 @@ function Show-Status {
 
     $s2Py = Join-Path $S2Venv 'Scripts\python.exe'
     if (Test-Path -LiteralPath $s2Py) {
-        foreach ($pack in @(@('torch'), @('transformers'), @('librosa'), @('imageio_ffmpeg'))) {
+        foreach ($pack in @(@('torch'), @('transformers'), @('librosa'), @('imageio_ffmpeg'), @('audio_separator'))) {
             if (Test-Imports $s2Py $pack) { Write-Ok ('sheetsage2 venv import: ' + $pack[0]) }
             else { Write-Warn2 ('sheetsage2 venv import failed: ' + $pack[0]) }
         }
@@ -711,6 +761,28 @@ if (-not $SkipSheetSage2) {
             Write-Ok 'SheetSage2 dependencies verified'
         } else {
             Write-Warn2 'torch / transformers / librosa still missing -- check the pip output above'
+        }
+        if (($Which -eq 'xpu') -or ($Which -eq 'cuda') -or ($Which -eq 'rocm')) {
+            if (Test-S2BackendReady $s2Py $Which) {
+                Write-Ok ($Which + ' acceleration is usable')
+            } else {
+                Write-Warn2 ($Which + ' runtime check returned non-zero (see logs\setup_env.log); keeping installed build (runtime will auto-fallback to CPU if needed)')
+            }
+        }
+    }
+    if (Test-Imports $s2Py @('audio_separator')) {
+        Write-Ok 'separation dependencies already present (audio-separator)'
+    } else {
+        Write-Host '  installing optional separation deps (HT-Demucs / Mel-Band RoFormer)'
+        try {
+            Install-Requirements $s2Py $S2SepReq 'SheetSage2 separation'
+        } catch {
+            Write-Warn2 ('separation deps could not be installed: ' + $_.Exception.Message)
+        }
+        if (Test-Imports $s2Py @('audio_separator')) {
+            Write-Ok 'separation dependencies verified (audio-separator)'
+        } else {
+            Write-Warn2 'separation deps still missing; the AI page will retry the install on first separate (needs network)'
         }
     }
 }

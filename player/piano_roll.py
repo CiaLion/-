@@ -1680,11 +1680,13 @@ class PianoRollDialog(QDialog):
 
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
+        root.setContentsMargins(6, 6, 6, 6)
         root.setSpacing(6)
 
         row = QHBoxLayout()
+        row.setSpacing(4)
         self.btn_open = self._btn("打开 MIDI…", "打开任意阶段 MIDI", self.open_file)
+        self.btn_open.setVisible(False)
         self.btn_save = self._btn("保存覆盖原 MIDI", "写回原文件，并同步同名 .json",
                                   self.save_over)
         self.btn_save_as = self._btn("另存为新 MIDI", "另存为；若同目录有同名 .json 也一并写",
@@ -1693,6 +1695,20 @@ class PianoRollDialog(QDialog):
         self.btn_redo = self._btn("↷ 重做", "Ctrl+Y", self.redo)
         for b in (self.btn_open, self.btn_save, self.btn_save_as, self.btn_undo, self.btn_redo):
             row.addWidget(b)
+        row.addSpacing(12)
+        self.cmb_track = QComboBox()
+        self.cmb_track.setFixedWidth(170)
+        self.cmb_track.currentIndexChanged.connect(self._switch_track)
+        self.lbl_track = QLabel("演奏角色：")
+        row.addWidget(self.lbl_track)
+        row.addWidget(self.cmb_track)
+        row.addWidget(QLabel("网格吸附："))
+        self.cmb_grid = QComboBox()
+        for text, div in (("不吸附", 0), ("1/2 拍", 2), ("1/4 拍", 4), ("1/8 拍", 8)):
+            self.cmb_grid.addItem(text, div)
+        self.cmb_grid.setCurrentIndex(2)
+        self.cmb_grid.currentIndexChanged.connect(self._grid_changed)
+        row.addWidget(self.cmb_grid)
         row.addStretch(1)
         self.btn_fix = self._btn("归位 40~88", "调用 pipeline.fix_pitch_range 做音域归位",
                                  self.fix_range)
@@ -1706,14 +1722,13 @@ class PianoRollDialog(QDialog):
                                    self.apply_custom, obj="primary")
         for b in (self.btn_fix, self.cmb_inst, self.btn_restore, self.btn_apply):
             row.addWidget(b)
+        root.addLayout(row)
 
-        tb_widget = QWidget()
-        tb_lay = QVBoxLayout(tb_widget)
-        tb_lay.setContentsMargins(0, 0, 0, 0)
-        tb_lay.setSpacing(6)
-        tb_lay.addLayout(row)
+        self.lbl_mode = QLabel("")
+        self.lbl_mode.setVisible(False)
 
         row2 = QHBoxLayout()
+        row2.setSpacing(8)
         self.btn_play = self._btn("▶ 试听", "空格：播放/暂停；也可用底部滑块或顶部节拍表拖动", self.preview)
         self.btn_stop = self._btn("⏹ 停止", "停止试听", self.stop_preview)
         row2.addWidget(self.btn_play)
@@ -1721,30 +1736,15 @@ class PianoRollDialog(QDialog):
         row2.addWidget(QLabel("音量:"))
         self.sld_vol = QSlider(Qt.Horizontal)
         self.sld_vol.setRange(0, 100)
-        _init_vol = int(PC.load().get("roll_volume", 35))
-        self.sld_vol.setValue(max(0, min(100, _init_vol)))
-        self.sld_vol.setFixedWidth(80)
+        self.sld_vol.setValue(max(0, min(100, int(PC.load().get("roll_volume", 35)))))
+        self.sld_vol.setFixedWidth(76)
         self.sld_vol.setToolTip("调节试听音量")
         self.lbl_vol = QLabel("%d%%" % self.sld_vol.value())
-        self.lbl_vol.setMinimumWidth(34)
+        self.lbl_vol.setFixedWidth(34)
         self.sld_vol.valueChanged.connect(self._on_volume_changed)
         row2.addWidget(self.sld_vol)
         row2.addWidget(self.lbl_vol)
-        self.lbl_mode = QLabel("")
-        row2.addWidget(self.lbl_mode)
-        self.cmb_track = QComboBox()
-        self.cmb_track.setMinimumWidth(200)
-        self.cmb_track.currentIndexChanged.connect(self._switch_track)
-        self.lbl_track = QLabel("轨道：")
-        row2.addWidget(self.lbl_track)
-        row2.addWidget(self.cmb_track)
-        row2.addWidget(QLabel("网格吸附："))
-        self.cmb_grid = QComboBox()
-        for text, div in (("不吸附", 0), ("1/2 拍", 2), ("1/4 拍", 4), ("1/8 拍", 8)):
-            self.cmb_grid.addItem(text, div)
-        self.cmb_grid.setCurrentIndex(2)
-        self.cmb_grid.currentIndexChanged.connect(self._grid_changed)
-        row2.addWidget(self.cmb_grid)
+
         self.chk_roll_arp = QCheckBox("和弦内音琶音")
         self.chk_roll_rhythm = QCheckBox("和弦扫弦律动")
         _arp, _rhythm = self.model.roll_flags()
@@ -1752,7 +1752,7 @@ class PianoRollDialog(QDialog):
         self.chk_roll_rhythm.setChecked(_rhythm)
         self.chk_roll_arp.toggled.connect(self._on_roll_flags_changed)
         self.chk_roll_rhythm.toggled.connect(self._on_roll_flags_changed)
-        self.chk_strum_mode = QCheckBox("2P柱式改用鼠标扫弦")
+        self.chk_strum_mode = QCheckBox("柱式改鼠标扫弦")
         self.chk_strum_mode.setChecked(self.model.roll_strum_mode())
         self.chk_strum_mode.toggled.connect(self._on_strum_mode_changed)
         row2.addWidget(self.chk_roll_arp)
@@ -1764,37 +1764,24 @@ class PianoRollDialog(QDialog):
         self.chk_phys_preview.toggled.connect(self._toggle_phys_preview)
         row2.addWidget(self.chk_phys_preview)
         row2.addStretch(1)
-        tb_lay.addLayout(row2)
 
-        row_chord = QHBoxLayout()
-        self.lbl_chord = QLabel("当前和弦：")
+        self.lbl_chord = QLabel("切片和弦:")
         self.cmb_chord = QComboBox()
         for name in ALL_CHORDS:
             self.cmb_chord.addItem(name, name)
-        self.cmb_chord.setMinimumWidth(90)
-        self.btn_chord = self._btn("应用到选中切片", "只允许 24 个游戏内和弦", self.apply_chord)
+        self.cmb_chord.setFixedWidth(76)
+        self.btn_chord = self._btn("替换", "只允许 24 个游戏内和弦", self.apply_chord)
         self.btn_strum_u = self._btn("＋左键上扫(强)", "已停用：和弦伴奏一律右键下扫", self.add_strum)
         self.btn_strum_u.setVisible(False)
-        self.btn_strum_d = self._btn("＋添加扫弦（右键下扫）", "生成 ≥3 音同帧簇，力度 75，右键下扫",
+        self.btn_strum_d = self._btn("+扫弦", "生成 ≥3 音同帧簇，力度 75，右键下扫",
                                      lambda: self.add_strum(False))
         self.cmb_string = QComboBox()
         self.cmb_string.addItems([str(i) for i in range(1, 7)])
-        self.btn_pluck = self._btn("＋单拨", "地雷弦会被锁死拒绝", self.add_pluck)
+        self.btn_pluck = self._btn("+单拨", "地雷弦会被锁死拒绝", self.add_pluck)
         for w in (self.lbl_chord, self.cmb_chord, self.btn_chord,
-                  self.btn_strum_u, self.btn_strum_d, self.cmb_string, self.btn_pluck):
-            row_chord.addWidget(w)
-        row_chord.addStretch(1)
-        tb_lay.addLayout(row_chord)
-
-        tb_scroll = QScrollArea()
-        tb_scroll.setFrameShape(QFrame.NoFrame)
-        tb_scroll.setWidgetResizable(True)
-        tb_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        tb_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        tb_scroll.setWidget(tb_widget)
-        tb_scroll.setMinimumWidth(360)
-        tb_scroll.setFixedHeight(tb_widget.sizeHint().height() + 18)
-        root.addWidget(tb_scroll)
+                  self.btn_strum_d, self.cmb_string, self.btn_pluck):
+            row2.addWidget(w)
+        root.addLayout(row2)
 
         root.addWidget(self.canvas, 1)
         self.canvas.setToolTip(
@@ -1826,7 +1813,7 @@ class PianoRollDialog(QDialog):
         self.lbl_legend.setObjectName("sub")
         self.lbl_legend.setTextFormat(Qt.RichText)
         self.lbl_legend.setWordWrap(False)
-        self.lbl_legend.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.lbl_legend.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
         status_row.addWidget(self.lbl_legend, 0)
         root.addLayout(status_row)
 
@@ -1949,10 +1936,10 @@ class PianoRollDialog(QDialog):
 
     def _update_legend(self):
         """按当前角色刷新颜色图例（右下角常驻）。"""
-        blue = "<span style='color:#58a6ff'>■</span>"
-        green = "<span style='color:#3fb950'>■</span>"
-        red = "<span style='color:#ff7b72'>■</span>"
-        amber = "<span style='color:#ffa657'>□</span>"
+        blue = "<span style='color:#2563eb'>■</span>"
+        green = "<span style='color:#16a34a'>■</span>"
+        red = "<span style='color:#dc2626'>■</span>"
+        amber = "<span style='color:#d97706'>□</span>"
         role = self.model.role if self.model.mode == "role" else None
         if role == MC.ROLE_SOLO:
             body = "%s蓝=主旋律  %s绿=伴奏  %s红=冲突不可弹  %s橙框=晚出" % (
@@ -2271,11 +2258,9 @@ class PianoRollDialog(QDialog):
 
     # ── 试听 ───────────────────────────────────────────────────────────
     def _play_wav(self, data):
-        import tempfile
         import winsound
         self._stop_wav()
-        fd, path = tempfile.mkstemp(prefix="yjyz_", suffix=".wav")
-        os.close(fd)
+        path = PC.tmp_wav_path("yjyz")
         try:
             with open(path, "wb") as f:
                 f.write(data)
@@ -2353,7 +2338,6 @@ class PianoRollDialog(QDialog):
     def _build_audio(self):
         if self.player is None or self._QMediaContent is None:
             return False
-        import tempfile
         data = self.preview_wav_bytes()
         self._cleanup_audio()
         try:
@@ -2361,8 +2345,7 @@ class PianoRollDialog(QDialog):
                 self.player.setMedia(self._QMediaContent())
         except Exception:
             pass
-        fd, path = tempfile.mkstemp(prefix="yjyz_full_", suffix=".wav")
-        os.close(fd)
+        path = PC.tmp_wav_path("yjyz_full")
         with open(path, "wb") as f:
             f.write(data)
         self._audio_path = path

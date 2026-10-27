@@ -331,8 +331,6 @@ def build_p2(flat_notes, chord_idx, bpm=None, enable_arpeggio=True, arpeggio_pat
         bass = _bass_in_range(bass_pc, 45, 56) or _bass_in_range(bass_pc, 40, 68)
         if bass is None:
             return []
-        if bass < 47 and bass + 12 <= 68:
-            bass += 12
         open_set = set(modes.STRING_OPEN.values())
         pool = sorted(p for p in range(bass, 69)
                       if (p % 12) in pcs and p not in open_set)
@@ -347,7 +345,9 @@ def build_p2(flat_notes, chord_idx, bpm=None, enable_arpeggio=True, arpeggio_pat
                 if cand % 12 == pc and cand not in open_set:
                     extra.append(cand)
                     break
-        cycle = [pool[0]] + sorted(set(extra)) + list(pool[1:]) if extra else pool
+        cycle = sorted(set(pool + extra))
+        if len(cycle) == 3:
+            cycle = [cycle[0], cycle[1], cycle[2], cycle[1]]
         tail_cap = float(sl["end"])
         idx = slices.index(sl)
         if (idx + 1) >= len(slices) or (idx + 1) not in hybrid_idx:
@@ -649,9 +649,10 @@ def build_p2(flat_notes, chord_idx, bpm=None, enable_arpeggio=True, arpeggio_pat
                 p_bass = _bass_in_range(bass_pc, 40, 74) or voice[0][1]
                 seq = [(t, int(p_bass))]
             else:
+                order = [0, 1, 2, 1] if len(voice) == 3 else list(range(len(voice)))
                 k, tt = 0, t
                 while tt <= limit + 1e-9 and k < 32:
-                    seq.append((tt, voice[k % len(voice)][1]))
+                    seq.append((tt, voice[order[k % len(order)]][1]))
                     tt += arp_step
                     k += 1
                 if not seq:
@@ -1364,6 +1365,18 @@ def adapt_song(song, flat_notes, enable_arpeggio=True, arpeggio_pattern=None,
         mel_idx = [i for i in mel_idx
                    if (names[i] if i < len(names) else "").strip().upper()
                    not in role_tracks]
+
+    non_empty = [i for i in sorted(by_track)
+                 if by_track.get(i) and DRUM_CH not in chans.get(i, ())]
+    chord_only = ("chords", "chords_merged", "chord", "和弦")
+    if len(non_empty) == 1:
+        sole = non_empty[0]
+        stem = os.path.splitext(os.path.basename(song.get("path") or ""))[0].strip().lower()
+        tname = str(names[sole] if sole < len(names) else "").strip().lower()
+        if stem not in chord_only and tname not in chord_only:
+            chord_idx.discard(sole)
+            if sole not in mel_idx:
+                mel_idx.append(sole)
 
     chord_flat = flat_notes
     audit_notes = flat_notes

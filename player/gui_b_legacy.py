@@ -9,7 +9,9 @@
   ⑤ 时序预设     主界面直出 30帧(默认)/60帧/90帧 三档预设，独立弹窗支持 6 项核心参数微调
 """
 import os
+import re
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -30,14 +32,16 @@ for _cand_plug in (
         os.environ["QT_PLUGIN_PATH"] = _cand_plug
         break
 
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QComboBox,
-                             QDialog, QDoubleSpinBox, QFileDialog, QFrame,
-                             QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-                             QLineEdit, QListWidget, QListWidgetItem,
-                             QMainWindow, QMessageBox, QPlainTextEdit,
+from PyQt5.QtCore import QUrl, QTimer, Qt, pyqtSignal
+from PyQt5.QtGui import QKeySequence
+from PyQt5.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup,
+                             QCheckBox, QComboBox, QDialog, QDoubleSpinBox,
+                             QFileDialog, QFrame, QGridLayout, QGroupBox,
+                             QHBoxLayout, QInputDialog, QLabel, QLineEdit,
+                             QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                              QProgressBar, QPushButton, QRadioButton,
-                             QScrollArea, QVBoxLayout, QWidget)
+                             QScrollArea, QShortcut, QSlider, QTreeWidget,
+                             QTreeWidgetItem, QVBoxLayout, QWidget)
 
 import input_engine as ie
 import midi_compiler as MC
@@ -113,7 +117,7 @@ class CompileWorker(threading.Thread):
 
     def __init__(self, path, role, done, fail, enable_arpeggio=True,
                  arpeggio_pattern="pingpong", enable_chord_rhythm=True,
-                 chord_strum_mode=False):
+                 chord_strum_mode=False, timing=None, max_prune_ratio=0.0):
         super(CompileWorker, self).__init__(daemon=True)
         self.path, self.role = path, role
         self.done, self.fail = done, fail
@@ -121,6 +125,8 @@ class CompileWorker(threading.Thread):
         self.arpeggio_pattern = arpeggio_pattern
         self.enable_chord_rhythm = enable_chord_rhythm
         self.chord_strum_mode = chord_strum_mode
+        self.timing = timing
+        self.max_prune_ratio = max_prune_ratio
 
     def run(self):
         try:
@@ -135,7 +141,9 @@ class CompileWorker(threading.Thread):
                                  enable_arpeggio=self.enable_arpeggio,
                                  arpeggio_pattern=self.arpeggio_pattern,
                                  enable_chord_rhythm=self.enable_chord_rhythm,
-                                 chord_strum_mode=self.chord_strum_mode)
+                                 chord_strum_mode=self.chord_strum_mode,
+                                 timing=self.timing,
+                                 max_prune_ratio=self.max_prune_ratio)
             self.done(tl)
         except Exception as exc:
             self.fail(exc)
@@ -260,6 +268,15 @@ class TimingConfigDialog(QDialog):
         lay.addWidget(self.adv_box, 1)
         self.adv_box.setVisible(True)
 
+        rec_row = QHBoxLayout()
+        rec_row.setSpacing(8)
+        rec_row.addWidget(owner.chk_rec)
+        rec_lab = QLabel("声卡：")
+        rec_lab.setObjectName("sub")
+        rec_row.addWidget(rec_lab)
+        rec_row.addWidget(owner.cmb_rec, 1)
+        lay.addLayout(rec_row)
+
         foot = QHBoxLayout()
         foot.setSpacing(8)
         foot.addStretch(1)
@@ -280,6 +297,44 @@ class TimingConfigDialog(QDialog):
         super(TimingConfigDialog, self).closeEvent(ev)
 
 
+class MidiTreeWidget(QTreeWidget):
+    def __init__(self, owner, parent=None):
+        super(MidiTreeWidget, self).__init__(parent)
+        self.owner = owner
+
+    def mimeData(self, items):
+        data = super(MidiTreeWidget, self).mimeData(items)
+        paths = []
+        for it in items:
+            val = it.data(0, Qt.UserRole)
+            if val and os.path.isfile(str(val)):
+                paths.append(str(val))
+        if paths:
+            data.setUrls([QUrl.fromLocalFile(p) for p in paths])
+        return data
+
+    def dragEnterEvent(self, ev):
+        if ev.mimeData().hasUrls():
+            ev.setDropAction(Qt.CopyAction)
+            ev.accept()
+        else:
+            super(MidiTreeWidget, self).dragEnterEvent(ev)
+
+    def dragMoveEvent(self, ev):
+        if ev.mimeData().hasUrls():
+            ev.setDropAction(Qt.CopyAction)
+            ev.accept()
+        else:
+            super(MidiTreeWidget, self).dragMoveEvent(ev)
+
+    def dropEvent(self, ev):
+        if ev.mimeData().hasUrls():
+            self.owner._midi_drop_files(ev)
+            ev.acceptProposedAction()
+        else:
+            super(MidiTreeWidget, self).dropEvent(ev)
+
+
 class MainWindow(QMainWindow):
     sig_compiled = pyqtSignal(object)
     sig_failed = pyqtSignal(object)
@@ -287,6 +342,7 @@ class MainWindow(QMainWindow):
     sig_progress = pyqtSignal(float, float)
     sig_finished = pyqtSignal(object)
     sig_devices = pyqtSignal(object)
+    sig_song_timing = pyqtSignal(object)
 
     def __init__(self):
         super(MainWindow, self).__init__()
@@ -299,6 +355,7 @@ class MainWindow(QMainWindow):
         self.player = None
         self.io = GameIO()
         self.role = MC.ROLE_SOLO
+        self._role_pick = MC.ROLE_SOLO
         self._hot_last = {}
         self.timing_spins = {}
         self._timing_dlg = None
@@ -309,6 +366,7 @@ class MainWindow(QMainWindow):
         self.sig_progress.connect(self._on_progress)
         self.sig_finished.connect(self._on_finished)
         self.sig_devices.connect(self._on_devices)
+        self.sig_song_timing.connect(self._on_song_timing)
 
         self._build_ui()
         self._update_switch_hints(self.role)
@@ -351,20 +409,37 @@ class MainWindow(QMainWindow):
         head.addWidget(self.btn_midi_import)
         lay.addLayout(head)
 
+        self.btn_studio = QPushButton("乐曲库")
+        self.btn_studio.setMinimumHeight(30)
+        self.btn_studio.setToolTip("检索在线乐谱或多轨 MIDI，生成分轨并手动对齐人声")
+        self.btn_studio.clicked.connect(self.open_multipart_studio)
+        lay.addWidget(self.btn_studio)
+
         self.edit_midi_search = QLineEdit()
         self.edit_midi_search.setPlaceholderText("搜索曲名…")
         self.edit_midi_search.setClearButtonEnabled(True)
         self.edit_midi_search.textChanged.connect(self._filter_midi_list)
         lay.addWidget(self.edit_midi_search)
 
-        self.midi_list = QListWidget()
+        self.midi_list = MidiTreeWidget(self)
         self.midi_list.setObjectName("midiList")
+        self.midi_list.setHeaderHidden(True)
+        self.midi_list.setColumnCount(1)
         self.midi_list.setAlternatingRowColors(True)
         self.midi_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.midi_list.setTextElideMode(Qt.ElideRight)
         self.midi_list.setMinimumWidth(0)
+        self.midi_list.setDragDropMode(QAbstractItemView.DragDrop)
+        self.midi_list.setDragEnabled(True)
+        self.midi_list.setAcceptDrops(True)
+        self.midi_list.setDropIndicatorShown(True)
+        self.midi_list.setDefaultDropAction(Qt.CopyAction)
         self.midi_list.itemClicked.connect(self._on_midi_item_clicked)
         self.midi_list.itemDoubleClicked.connect(self._on_midi_item_clicked)
+        self.midi_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.midi_list.customContextMenuRequested.connect(self._midi_menu)
+        QShortcut(QKeySequence("F2"), self.midi_list, activated=self._midi_rename)
+        QShortcut(QKeySequence("Delete"), self.midi_list, activated=self._midi_delete)
         lay.addWidget(self.midi_list, 1)
 
         self.lbl_midi_count = QLabel("（正在扫描…）")
@@ -372,26 +447,49 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.lbl_midi_count)
         return box
 
-    def _midi_library_items(self):
-        """曲库内容：内置测试曲置顶，其后是 out/ 里的成品 MIDI。"""
-        items = []
+    MULTIPART_PREFIXES = ("part0_", "part1_", "part2_", "part3_", "all_parts_")
+
+    def _midi_library_tree(self):
+        """返回 (分组列表, 顶层单曲列表)；分组 = (标题, [(名, 路径)], 目录)。"""
+        groups, singles = [], []
         demo = os.path.join(TEST_MIDI_DIR, "sample_demo.mid")
         if os.path.isfile(demo):
-            items.append(("[内置测试] sample_demo", demo))
+            singles.append(("[内置测试] sample_demo", demo))
         try:
-            names = sorted(os.listdir(OUT_DIR), key=lambda s: s.lower())
+            names = sorted(os.listdir(OUT_DIR), key=lambda x: x.lower())
         except Exception:
             names = []
         for name in names:
+            path = os.path.join(OUT_DIR, name)
+            if os.path.isdir(path):
+                if name.startswith("_") or name.lower().startswith("temp_sep"):
+                    continue
+                kids = []
+                try:
+                    for fn in sorted(os.listdir(path), key=lambda x: x.lower()):
+                        low = fn.lower()
+                        if not low.endswith((".mid", ".midi")):
+                            continue
+                        if os.path.splitext(low)[0] in self.MIDI_INTERMEDIATE_STEMS:
+                            continue
+                        kids.append((fn, os.path.join(path, fn)))
+                except Exception:
+                    kids = []
+                title = ("📁 %s (%d首)" % (name, len(kids)) if kids
+                         else "📁 %s (空)" % name)
+                groups.append((title, kids, path))
+                continue
             low = name.lower()
             if not low.endswith((".mid", ".midi")):
                 continue
             if os.path.splitext(low)[0] in self.MIDI_INTERMEDIATE_STEMS:
                 continue
-            path = os.path.join(OUT_DIR, name)
-            if os.path.isfile(path):
-                items.append((name, path))
-        return items
+            singles.append((name, path))
+        multi = [x for x in singles if x[0].lower().startswith(self.MULTIPART_PREFIXES)]
+        if multi:
+            groups.insert(0, ("📁 多声部合奏工程 (%d首)" % len(multi), multi, OUT_DIR))
+            singles = [x for x in singles if x not in multi]
+        return groups, singles
 
     def refresh_midi_list(self):
         """重扫曲库（扒谱完成、卷帘另存、导入后都会自动调用）。"""
@@ -400,52 +498,248 @@ class MainWindow(QMainWindow):
         keep = getattr(self, "_midi_selected_path", None) or self.path
         try:
             self.midi_list.clear()
+            groups, singles = self._midi_library_tree()
             count = 0
-            for label, path in self._midi_library_items():
-                item = QListWidgetItem(label)
-                item.setData(Qt.UserRole, path)
-                item.setToolTip(path)
-                self.midi_list.addItem(item)
+            for title, kids, folder in groups:
+                top = QTreeWidgetItem([title])
+                top.setData(0, Qt.UserRole + 2, folder)
+                top.setToolTip(0, folder)
+                self.midi_list.addTopLevelItem(top)
+                for name, path in kids:
+                    item = QTreeWidgetItem([name])
+                    item.setData(0, Qt.UserRole, path)
+                    item.setToolTip(0, path)
+                    top.addChild(item)
+                    count += 1
+            for name, path in singles:
+                item = QTreeWidgetItem([name])
+                item.setData(0, Qt.UserRole, path)
+                item.setToolTip(0, path)
+                self.midi_list.addTopLevelItem(item)
                 count += 1
-                if keep and os.path.abspath(path) == os.path.abspath(str(keep)):
-                    self.midi_list.setCurrentItem(item)
+            self.midi_list.expandAll()
+            self._midi_total = count
+            if keep:
+                self._select_midi_path(keep)
             self._filter_midi_list()
             self.lbl_midi_count.setText("共 %d 首（点一下即加载）" % count)
         except Exception as exc:
             self._append_log("× 曲库刷新失败：%s" % exc)
 
+    def _select_midi_path(self, path):
+        target = os.path.abspath(str(path))
+        for i in range(self.midi_list.topLevelItemCount()):
+            top = self.midi_list.topLevelItem(i)
+            items = [top] + [top.child(j) for j in range(top.childCount())]
+            for item in items:
+                got = item.data(0, Qt.UserRole)
+                if got and os.path.abspath(str(got)) == target:
+                    self.midi_list.setCurrentItem(item)
+                    return
+
     def _filter_midi_list(self, _text=None):
-        """按搜索框实时过滤（隐藏不匹配的行）。"""
+        """按搜索框过滤，命中项自动展开父节点。"""
         if not hasattr(self, "midi_list"):
             return
         key = (self.edit_midi_search.text() if hasattr(self, "edit_midi_search") else "")
         key = str(key or "").strip().lower()
         shown = 0
-        for i in range(self.midi_list.count()):
-            item = self.midi_list.item(i)
-            hit = (not key) or (key in item.text().lower())
-            item.setHidden(not hit)
-            if hit:
-                shown += 1
+        for i in range(self.midi_list.topLevelItemCount()):
+            top = self.midi_list.topLevelItem(i)
+            if top.childCount():
+                hit_any = False
+                for j in range(top.childCount()):
+                    child = top.child(j)
+                    hit = (not key) or (key in child.text(0).lower())
+                    child.setHidden(not hit)
+                    if hit:
+                        hit_any = True
+                        shown += 1
+                top.setHidden(not hit_any)
+                if key and hit_any:
+                    top.setExpanded(True)
+            else:
+                hit = (not key) or (key in top.text(0).lower())
+                top.setHidden(not hit)
+                if hit:
+                    shown += 1
         if hasattr(self, "lbl_midi_count"):
             if key:
                 self.lbl_midi_count.setText("匹配 %d 首（点一下即加载）" % shown)
             else:
                 self.lbl_midi_count.setText(
-                    "共 %d 首（点一下即加载）" % self.midi_list.count())
+                    "共 %d 首（点一下即加载）" % int(getattr(self, "_midi_total", shown)))
 
-    def _on_midi_item_clicked(self, item):
-        """点列表里的曲目 → 立即加载并编译。"""
+    def _midi_menu(self, pos):
+        item = self.midi_list.itemAt(pos)
+        if item is None:
+            return
+        self.midi_list.setCurrentItem(item)
+        menu = QMenu(self)
+        menu.addAction("新建文件夹…", self._midi_new_folder)
+        menu.addAction("重命名 (F2)", self._midi_rename)
+        menu.addAction("删除 (Del)", self._midi_delete)
+        menu.addAction("打开所在文件夹", self._midi_reveal)
+        menu.exec_(self.midi_list.viewport().mapToGlobal(pos))
+
+    def _midi_target(self):
+        item = self.midi_list.currentItem()
+        if item is None:
+            return None
+        folder = item.data(0, Qt.UserRole + 2)
+        if folder:
+            return str(folder)
+        path = item.data(0, Qt.UserRole)
+        return str(path) if path else None
+
+    def _midi_folder_of(self, item=None):
+        item = item if item is not None else self.midi_list.currentItem()
+        if item is None:
+            return OUT_DIR
+        folder = item.data(0, Qt.UserRole + 2)
+        if folder:
+            return str(folder)
+        path = item.data(0, Qt.UserRole)
+        if path and os.path.isfile(str(path)):
+            return os.path.dirname(str(path))
+        return OUT_DIR
+
+    def _midi_new_folder(self):
+        base = self._midi_folder_of()
+        name, ok = QInputDialog.getText(self, "新建文件夹", "文件夹名称：")
+        name = re.sub(r'[\\/:*?"<>|]+', "_", str(name or "").strip()).strip(" ._")
+        if not ok or not name:
+            return
+        path = os.path.join(base, name)
         try:
-            path = item.data(Qt.UserRole)
-        except Exception:
-            path = None
-        if not path or not os.path.isfile(path):
+            os.makedirs(path, exist_ok=True)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "新建失败", str(exc))
             return
-        if self.path and os.path.abspath(path) == os.path.abspath(str(self.path)):
+        self.refresh_midi_list()
+
+    def _midi_drop_files(self, ev):
+        folder = self._midi_folder_of(self.midi_list.itemAt(ev.pos()))
+        src = ev.source()
+        moved = 0
+        for url in ev.mimeData().urls():
+            if not url.isLocalFile():
+                continue
+            path = url.toLocalFile()
+            if not (os.path.isfile(path) and path.lower().endswith((".mid", ".midi"))):
+                continue
+            dest = os.path.join(folder, os.path.basename(path))
+            if os.path.abspath(dest) == os.path.abspath(path):
+                continue
+            try:
+                if src is self.midi_list:
+                    shutil.move(path, dest)
+                else:
+                    shutil.copy2(path, dest)
+                moved += 1
+            except Exception as exc:  # noqa: BLE001
+                self._append_log("× 拖入失败：%s" % exc)
+        if moved:
+            self._append_log("已拖入 %d 个 MIDI → %s"
+                             % (moved, os.path.basename(folder) or "out"))
+            self.refresh_midi_list()
+
+    def _midi_after_change(self, old_path, new_path=None, was_dir=False):
+        cur = str(self.path or "")
+        old_abs = os.path.abspath(str(old_path))
+        same_file = bool(cur) and os.path.abspath(cur) == old_abs
+        inside_dir = bool(cur) and was_dir and cur.startswith(old_abs + os.sep)
+        if (same_file or inside_dir) and new_path:
+            self.path = new_path
+            self.lbl_file.setText(os.path.basename(new_path))
+        elif same_file or inside_dir:
+            self.path = None
+            self.timelines = {}
+            self.lbl_file.setText("（还没选歌）")
+        self.refresh_midi_list()
+
+    def _midi_rename(self):
+        path = self._midi_target()
+        if not path or not os.path.exists(path):
             return
-        self._midi_selected_path = path
-        self.load(path)
+        is_dir = os.path.isdir(path)
+        base = os.path.basename(path.rstrip("\\/"))
+        stem = base if is_dir else os.path.splitext(base)[0]
+        new, ok = QInputDialog.getText(self, "重命名", "新名称：", text=stem)
+        new = (new or "").strip()
+        if not ok or not new or new == stem:
+            return
+        if not is_dir:
+            ext = os.path.splitext(base)[1] or ".mid"
+            if not new.lower().endswith((".mid", ".midi")):
+                new += ext
+        dest = os.path.join(os.path.dirname(path), new)
+        if os.path.exists(dest):
+            QMessageBox.warning(self, "重命名失败", "已存在同名文件：%s" % new)
+            return
+        try:
+            os.rename(path, dest)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "重命名失败", str(exc))
+            return
+        moved = os.path.join(dest, os.path.relpath(str(self.path), path)) if (
+            is_dir and self.path and os.path.abspath(str(self.path)).startswith(
+                os.path.abspath(path) + os.sep)) else None
+        self._midi_after_change(path, moved if is_dir else dest, was_dir=is_dir)
+
+    def _midi_delete(self):
+        path = self._midi_target()
+        if not path or not os.path.exists(path):
+            return
+        name = os.path.basename(path.rstrip("\\/"))
+        was_dir = os.path.isdir(path)
+        if QMessageBox.question(
+                self, "从曲库删除",
+                "确定要从曲库删除“%s”吗？\n（文件将移至 logs/trash 回收夹，可随时找回）" % name,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        trash = os.path.join(PROJECT_DIR, "logs", "trash")
+        try:
+            os.makedirs(trash, exist_ok=True)
+            dest = os.path.join(trash, "%s_%s" % (time.strftime("%Y%m%d-%H%M%S"), name))
+            shutil.move(path, dest)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "删除失败", str(exc))
+            return
+        self._midi_after_change(path, None, was_dir=was_dir)
+
+    def _midi_reveal(self):
+        path = self._midi_target()
+        if not path:
+            return
+        try:
+            if os.path.exists(path):
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            else:
+                os.startfile(OUT_DIR)
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "打不开目录", str(exc))
+
+    def _on_midi_item_clicked(self, item, _col=0):
+        """点曲目节点 → 立即加载并编译。"""
+        path = item.data(0, Qt.UserRole) if item is not None else None
+        if not path or not os.path.isfile(str(path)):
+            return
+        if self.path and os.path.abspath(str(path)) == os.path.abspath(str(self.path)):
+            return
+        self._midi_selected_path = str(path)
+        self.load(str(path))
+
+    def open_multipart_studio(self):
+        try:
+            from multipart_studio import MultipartStudioDialog
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.warning(self, "乐曲库不可用", "乐曲库加载失败：%s" % exc)
+            return None
+        dlg = MultipartStudioDialog(self, on_done=self.refresh_midi_list)
+        dlg.show()
+        dlg.raise_()
+        return dlg
 
     def import_midi_files(self):
         """把电脑任意位置的 MIDI 复制进 out/ 归档，然后刷新曲库。"""
@@ -514,9 +808,17 @@ class MainWindow(QMainWindow):
         self.btn_testmidi.setToolTip("直接加载 assets/test_midis/sample_demo.mid")
         self.btn_testmidi.clicked.connect(self.open_test_midi)
         row.addWidget(self.btn_testmidi)
+        self.btn_testmidi.setVisible(False)
+        row.addWidget(QLabel("当前曲目："))
         self.lbl_file = QLabel("（还没选歌）")
         self.lbl_file.setObjectName("sub")
         row.addWidget(self.lbl_file, 1)
+        self.chk_auto_accomp = QCheckBox("开启和弦自动生成伴奏")
+        self.chk_auto_accomp.setToolTip(
+            "开启：1P 为指弹独奏；关闭：1P 只弹主音旋律，2P 伴奏角色一并置灰")
+        self.chk_auto_accomp.setChecked(bool(PC.load().get("enable_auto_accomp", True)))
+        self.chk_auto_accomp.toggled.connect(self._on_auto_accomp_toggled)
+        row.addWidget(self.chk_auto_accomp)
         self.btn_roll = QPushButton("打开钢琴卷帘微调")
         self.btn_roll.setToolTip("打开当前角色的转译序列；改完可直接重编并更新演奏台")
         self.btn_roll.clicked.connect(self.open_piano_roll)
@@ -542,18 +844,27 @@ class MainWindow(QMainWindow):
         grid = QGridLayout()
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(8)
-        for i, r in enumerate(ROLE_ORDER):
+        role_text = {
+            MC.ROLE_SOLO: ("1P 主音 / 独奏",
+                           "开启自动伴奏时为指弹独奏；关闭时为纯主音旋律"),
+            MC.ROLE_DUET_RHYTHM_FRET: (ROLE_TITLE[MC.ROLE_DUET_RHYTHM_FRET],
+                                       ROLE_TIP[MC.ROLE_DUET_RHYTHM_FRET]),
+            MC.ROLE_DUET_RHYTHM: (ROLE_TITLE[MC.ROLE_DUET_RHYTHM],
+                                  ROLE_TIP[MC.ROLE_DUET_RHYTHM]),
+        }
+        for i, r in enumerate(role_text):
+            title, tip = role_text[r]
             cell = QWidget()
             cv = QVBoxLayout(cell)
             cv.setContentsMargins(0, 0, 0, 0)
             cv.setSpacing(1)
-            rb = QRadioButton(ROLE_TITLE[r])
+            rb = QRadioButton(title)
             rb.setObjectName("roleRadio")
             rb.setChecked(r == self.role)
             rb.toggled.connect(lambda on, rr=r: on and self.choose_role(rr))
             self.role_group.addButton(rb, i)
             cv.addWidget(rb)
-            desc = QLabel(ROLE_TIP[r])
+            desc = QLabel(tip)
             desc.setObjectName("roleDesc")
             desc.setContentsMargins(24, 0, 0, 0)
             desc.setWordWrap(True)
@@ -578,6 +889,10 @@ class MainWindow(QMainWindow):
             cv.addStretch(1)
             grid.addWidget(cell, i // 2, i % 2)
             self.radios[r] = rb
+        rb_lead = QRadioButton(ROLE_TITLE[MC.ROLE_DUET_LEAD])
+        rb_lead.setVisible(False)
+        self.role_group.addButton(rb_lead, 9)
+        self.radios[MC.ROLE_DUET_LEAD] = rb_lead
         a.addLayout(grid)
 
         v.addWidget(c1)
@@ -588,8 +903,8 @@ class MainWindow(QMainWindow):
         b = QVBoxLayout(c2)
         b.setContentsMargins(12, 10, 12, 10)
         b.setSpacing(6)
-        b.addWidget(self._section("演奏前游戏内准备步骤"))
-        self.lbl_guide = QLabel("（选完歌，这里会写出三步）")
+        b.addWidget(self._section("演奏准备"))
+        self.lbl_guide = QLabel("请在左侧曲库选择一首曲目")
         self.lbl_guide.setObjectName("guide_text")
         self.lbl_guide.setWordWrap(True)
         self.lbl_guide.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -598,11 +913,11 @@ class MainWindow(QMainWindow):
         row_g.addWidget(self.lbl_guide, 1)
         col_tools = QVBoxLayout()
         col_tools.setSpacing(6)
-        self.btn_calibrate = QPushButton("◎ 指示圈校准轮盘")
+        self.btn_calibrate = QPushButton("校准轮盘")
         self.btn_calibrate.setMinimumWidth(200)
         self.btn_calibrate.clicked.connect(self._auto_calibrate)
         col_tools.addWidget(self.btn_calibrate)
-        self.btn_diag = QPushButton("✦ 4 步硬件自检")
+        self.btn_diag = QPushButton("硬件自检（4 步）")
         self.btn_diag.setMinimumWidth(200)
         self.btn_diag.clicked.connect(self._open_diag)
         col_tools.addWidget(self.btn_diag)
@@ -615,6 +930,12 @@ class MainWindow(QMainWindow):
         self.btn_play.setCheckable(True)
         self.btn_play.clicked.connect(self.toggle_play)
         row2.addWidget(self.btn_play)
+        self.btn_stop_play = QPushButton("⏹ 停止（F12）")
+        self.btn_stop_play.setObjectName("danger")
+        self.btn_stop_play.setMinimumHeight(44)
+        self.btn_stop_play.setEnabled(False)
+        self.btn_stop_play.clicked.connect(self.stop_play)
+        row2.addWidget(self.btn_stop_play)
         spin_lab = QLabel("播放倍速")
         spin_lab.setObjectName("sub")
         row2.addWidget(spin_lab)
@@ -639,14 +960,8 @@ class MainWindow(QMainWindow):
         row3 = QHBoxLayout()
         self.chk_rec = QCheckBox("同步内录系统声音")
         self.chk_rec.setChecked(False)
-        row3.addWidget(self.chk_rec)
-        rec_lab = QLabel("声卡：")
-        rec_lab.setObjectName("sub")
-        row3.addWidget(rec_lab)
         self.cmb_rec = QComboBox()
         self.cmb_rec.addItem("（正在查找声卡…）")
-        row3.addWidget(self.cmb_rec, 1)
-        c.addLayout(row3)
         self._load_devices()
         self._build_advanced(c)
         self.bar = QProgressBar()
@@ -719,6 +1034,31 @@ class MainWindow(QMainWindow):
             preset_row.addWidget(btn, 1)
         v.addLayout(preset_row)
 
+        row_follow = QHBoxLayout()
+        row_follow.setSpacing(8)
+        self.chk_follow_song = QCheckBox("跟随本曲参数（选歌后可用）")
+        self.chk_follow_song.setEnabled(False)
+        self.chk_follow_song.toggled.connect(self._on_follow_toggled)
+        row_follow.addWidget(self.chk_follow_song)
+        self.lbl_prune = QLabel("允许删音：0%（不删音）")
+        self.lbl_prune.setObjectName("sub")
+        row_follow.addWidget(self.lbl_prune)
+        self.sld_prune = QSlider(Qt.Horizontal)
+        self.sld_prune.setRange(0, 15)
+        self.sld_prune.setFixedWidth(130)
+        try:
+            self.sld_prune.setValue(int(PC.load().get("prune_ratio", 0) or 0))
+        except Exception:
+            self.sld_prune.setValue(0)
+        self.sld_prune.valueChanged.connect(self._on_prune_changed)
+        row_follow.addWidget(self.sld_prune)
+        row_follow.addStretch(1)
+        self.lbl_compile_badge = QLabel("")
+        self.lbl_compile_badge.setWordWrap(False)
+        row_follow.addWidget(self.lbl_compile_badge)
+        v.addLayout(row_follow)
+        self._update_prune_label(self.sld_prune.value())
+
         # 若检测到本地仍是旧版配置（min_action_interval > 0.005），自动迁移写入新版 30fps 默认预设
         if self._current_preset_name() is None:
             try:
@@ -730,7 +1070,7 @@ class MainWindow(QMainWindow):
 
         row = QHBoxLayout()
         row.setSpacing(10)
-        self.btn_adv = QPushButton("⚙ 高级时间参数 (6项)…")
+        self.btn_adv = QPushButton("高级时间参数（6 项）…")
         self.btn_adv.setToolTip("打开独立弹窗调整 6 项核心时间参数；保存后立即重编生效")
         self.btn_adv.clicked.connect(self._open_timing_dialog)
         row.addWidget(self.btn_adv)
@@ -822,6 +1162,93 @@ class MainWindow(QMainWindow):
             inner.adjustSize()
         except Exception:
             pass
+
+    def _follow_active(self):
+        chk = getattr(self, "chk_follow_song", None)
+        return bool(chk is not None and chk.isEnabled() and chk.isChecked())
+
+    def _on_follow_toggled(self, checked):
+        if checked:
+            if self.path:
+                self._compile()
+        else:
+            self.apply_timing_preset(self._current_preset_name()
+                                     or PC.DEFAULT_TIMING_PRESET)
+
+    def _on_prune_changed(self, val):
+        self._update_prune_label(int(val))
+        try:
+            PC.save({"prune_ratio": int(val)})
+        except Exception:
+            pass
+        if not self.path:
+            return
+        if self._follow_active():
+            self._update_song_timing()
+        else:
+            self._compile()
+
+    def _update_prune_label(self, val):
+        if not hasattr(self, "lbl_prune"):
+            return
+        if int(val) == 0:
+            self.lbl_prune.setText("允许删音：0%（不删音）")
+        else:
+            self.lbl_prune.setText("允许删音：%d%%" % int(val))
+
+    def _update_compile_badge(self, tl=None):
+        if not hasattr(self, "lbl_compile_badge"):
+            return
+        tl = tl or self.timelines.get(self.role) or {}
+        st = tl.get("stats") or {}
+        late = int(st.get("late") or 0)
+        cut = int(st.get("trimmed_accomp") or 0)
+        if late == 0 and cut == 0:
+            self.lbl_compile_badge.setText("编排就绪：0 晚出 · 0 删音")
+            self.lbl_compile_badge.setStyleSheet("color:#16a34a; font-weight:700;")
+        else:
+            self.lbl_compile_badge.setText(
+                "晚出 %d 音 · 已删减 %d 音（可升一档帧率或调高删音滑块）"
+                % (late, cut))
+            self.lbl_compile_badge.setStyleSheet("color:#d97706; font-weight:700;")
+
+    def _update_song_timing(self):
+        self._song_timing = None
+        if not hasattr(self, "chk_follow_song"):
+            return
+        path, role = self.path, self.role
+        prune = (self.sld_prune.value() / 100.0) if hasattr(self, "sld_prune") else 0.0
+        if not path:
+            self.chk_follow_song.setEnabled(False)
+            self.chk_follow_song.setText("跟随本曲参数（选歌后可用）")
+            return
+        self.chk_follow_song.setEnabled(False)
+        self.chk_follow_song.setText("跟随本曲参数（推导中…）")
+
+        def work():
+            info = None
+            try:
+                info = MC.deduce_song_timing(path, role=role, max_prune_ratio=prune)
+            except Exception:
+                info = None
+            try:
+                self.sig_song_timing.emit(info)
+            except Exception:
+                pass
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_song_timing(self, info):
+        if not info or not self.path:
+            if hasattr(self, "chk_follow_song"):
+                self.chk_follow_song.setEnabled(False)
+                self.chk_follow_song.setText("跟随本曲参数（选歌后可用）")
+            return
+        self._song_timing = info
+        self.chk_follow_song.setEnabled(True)
+        self.chk_follow_song.setText("跟随本曲参数（推荐 ≥%d 帧）" % info["recommend_fps"])
+        if self._follow_active():
+            self._compile()
 
     def _open_timing_dialog(self):
         dlg = self._timing_dlg
@@ -920,6 +1347,10 @@ class MainWindow(QMainWindow):
                 self.lbl_timing_hint.setText(self._timing_hint_base)
             except Exception:
                 pass
+            if getattr(self, "chk_follow_song", None) is not None:
+                self.chk_follow_song.blockSignals(True)
+                self.chk_follow_song.setChecked(False)
+                self.chk_follow_song.blockSignals(False)
             self._append_log("已切换到 %s 预设（%d 项已写盘）" % (name, len(vals)))
             self._sync_preset_radios(name)
             if self.path:
@@ -1006,15 +1437,41 @@ class MainWindow(QMainWindow):
 
     def load(self, path):
         self.path = path
+        self._update_song_timing()
         self.timelines = {}
         self.custom_role_notes = {}
         self.lbl_file.setText(os.path.basename(path))
         self._append_log("载入：%s" % path)
         self._compile()
 
+    def _effective_role(self):
+        if self._role_pick == MC.ROLE_SOLO:
+            return MC.ROLE_SOLO if self.chk_auto_accomp.isChecked() else MC.ROLE_DUET_LEAD
+        return self._role_pick
+
+    def _on_auto_accomp_toggled(self, on):
+        PC.save({"enable_auto_accomp": bool(on)})
+        for r in (MC.ROLE_DUET_RHYTHM_FRET, MC.ROLE_DUET_RHYTHM):
+            rb = self.radios.get(r)
+            if rb is not None:
+                rb.setEnabled(bool(on))
+        if not on and self._role_pick in (MC.ROLE_DUET_RHYTHM_FRET, MC.ROLE_DUET_RHYTHM):
+            self._role_pick = MC.ROLE_SOLO
+        self.role = self._effective_role()
+        rb_solo = self.radios.get(MC.ROLE_SOLO)
+        if rb_solo is not None and not rb_solo.isChecked():
+            rb_solo.setChecked(True)
+        self.timelines.clear()
+        self._update_switch_hints(self.role)
+        self._append_log("和弦自动生成伴奏已%s" % ("开启" if on else "关闭（1P 纯主音）"))
+        if self.path:
+            self._compile()
+
     def choose_role(self, role):
-        self.role = role
-        self._update_switch_hints(role)
+        self._role_pick = role
+        self.role = self._effective_role()
+        self._update_switch_hints(self.role)
+        self._update_song_timing()
         if self.path:
             self._compile()
 
@@ -1043,6 +1500,18 @@ class MainWindow(QMainWindow):
                 w.setToolTip(tip_on if on else tip_off)
             except Exception:
                 pass
+        auto_on = True
+        try:
+            auto_on = bool(self.chk_auto_accomp.isChecked())
+        except Exception:
+            pass
+        for r in (MC.ROLE_DUET_RHYTHM_FRET, MC.ROLE_DUET_RHYTHM):
+            rb = getattr(self, "radios", {}).get(r)
+            if rb is not None:
+                try:
+                    rb.setEnabled(bool(auto_on))
+                except Exception:
+                    pass
 
     def _on_arpeggio_toggled(self, checked):
         PC.save({"enable_arpeggio": bool(checked)})
@@ -1094,29 +1563,37 @@ class MainWindow(QMainWindow):
                                if hasattr(self, "chk_chord_rhythm") else True)
         chord_strum_mode = (self.chk_strum_mode.isChecked()
                             if hasattr(self, "chk_strum_mode") else False)
+        timing, prune = None, 0.0
+        if self._follow_active() and getattr(self, "_song_timing", None):
+            timing = MC.Timing(dict(self._song_timing["timing"]))
+        if hasattr(self, "sld_prune"):
+            prune = self.sld_prune.value() / 100.0
         w = CompileWorker(self.path, self.role, ok, bad,
                           enable_arpeggio=enable_arpeggio,
                           arpeggio_pattern=arpeggio_pattern,
                           enable_chord_rhythm=enable_chord_rhythm,
-                          chord_strum_mode=chord_strum_mode)
+                          chord_strum_mode=chord_strum_mode,
+                          timing=timing, max_prune_ratio=prune)
         w.start()
 
     def _on_compiled(self, tl):
         self.timelines[tl["role"]] = tl
         self._append_log(MC.report_text(tl).replace("\n", " ｜ "))
         self.refresh_guide(tl)
+        self._update_compile_badge(tl)
 
     def refresh_guide(self, tl=None):
         """把按 Z / 按 T·R / 按 F8 三步提示刷新成当前角色的真实起始页。"""
         tl = tl or self.timelines.get(self.role)
         if not tl:
-            self.lbl_guide.setText("（选完歌，这里会写出三步）")
+            self.lbl_guide.setText("请在左侧曲库选择一首曲目")
             return
         st = tl.get("start") or {}
-        steps = ["① 游戏里按 Z 键，切到【%s模式】" % (st.get("mode_cn") or "品格"),
-                 "② 按 T / R 翻到【第 %s 页】（%s）" % (st.get("page") or 1, st.get("wheel") or ""),
-                 "③ 切回游戏窗口，按 F8 开始"]
-        self.lbl_guide.setText("\n".join(steps))
+        self.lbl_guide.setText(
+            "吉他模式：%s ｜ 起始页码：第 %s 页（%s）\n"
+            "切回游戏按 F8 开始/暂停，按 F12 停止"
+            % (st.get("mode_cn") or "品格", st.get("page") or 1,
+               st.get("wheel") or "无需翻页"))
 
     def sync_external(self, path, timelines=None):
         self.path = str(path)
@@ -1291,6 +1768,17 @@ class MainWindow(QMainWindow):
 
         threading.Thread(target=job, daemon=True).start()
 
+    def stop_play(self):
+        if self.player and self.player.is_alive():
+            self.player.stop()
+        self.player = None
+        self.btn_play.setChecked(False)
+        self.btn_play.setText("▶ 开始演奏（F8）")
+        self.bar.setValue(0)
+        if hasattr(self, "btn_stop_play"):
+            self.btn_stop_play.setEnabled(False)
+        self._append_log("⏹ 已停止演奏")
+
     def toggle_play(self):
         if self.player and self.player.is_alive():
             if self.player.paused:
@@ -1314,6 +1802,8 @@ class MainWindow(QMainWindow):
         self.bar.setValue(0)
         self.btn_play.setText("暂停（F8）")
         self.btn_play.setChecked(True)
+        if hasattr(self, "btn_stop_play"):
+            self.btn_stop_play.setEnabled(True)
 
         rec = None
         if self.chk_rec.isChecked():
@@ -1344,6 +1834,8 @@ class MainWindow(QMainWindow):
     def _on_finished(self, stats):
         self.btn_play.setText("▶ 开始演奏（F8）")
         self.btn_play.setChecked(False)
+        if hasattr(self, "btn_stop_play"):
+            self.btn_stop_play.setEnabled(False)
         if stats:
             self._append_log("本次：%d 条动作，迟到 %d 条（最多 %.0f 毫秒）"
                              % (stats.get("events", 0), stats.get("late", 0),
@@ -1366,6 +1858,8 @@ class MainWindow(QMainWindow):
                 else:
                     if self.player and self.player.is_alive():
                         self.player.stop()
+                        if hasattr(self, "btn_stop_play"):
+                            self.btn_stop_play.setEnabled(False)
                         self._append_log("F12 紧急停止")
             self._hot_last[name] = down
 

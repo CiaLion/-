@@ -30,7 +30,9 @@ DEFAULTS = {
     "enable_arpeggio": True, # 开启指弹横按琶音（伴奏与独奏空隙展开为流水琶音）
     # 2P 和弦伴奏是否按真实单拍做整拍扫弦律动（关 = 每个切片只扫 1 次）
     "enable_chord_rhythm": True,
+    "enable_auto_accomp": True,
     "roll_volume": 35,       # 卷帘试听音量（0~100）
+    "prune_ratio": 0,        # 允许删音百分比（0~15），0 = 不删
     "timing": {},            # 延迟参数（见 TIMING_INFO），空 = 全用默认
 }
 
@@ -174,6 +176,44 @@ for (_k, _cn, _d, _u, _lo, _hi, _lv, _note) in TIMING_INFO_ALL:
     TIMING_DEFAULTS[_k] = _d
     TIMING_META[_k] = {"key": _k, "cn": _cn, "default": _d, "unit": _u,
                        "min": _lo, "max": _hi, "level": _lv, "note": _note}
+
+def tmp_wav_path(prefix="tmp"):
+    import os
+    import tempfile
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    folder = os.path.join(root, "logs", "tmp_wav")
+    os.makedirs(folder, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix=prefix + "_", suffix=".wav", dir=folder)
+    os.close(fd)
+    return path
+
+
+def clean_tmp_wav():
+    import glob
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    folder = os.path.join(root, "logs", "tmp_wav")
+    removed = 0
+    for path in glob.glob(os.path.join(folder, "*.wav")):
+        try:
+            os.remove(path)
+            removed += 1
+        except Exception:
+            pass
+    return removed
+
+
+def build_timing_for_frame_ms(frame_ms):
+    """按单帧毫秒数生成一套时间参数（11~33ms）。"""
+    f = max(11.0, min(33.0, float(frame_ms)))
+    hold = round((f + 1.0) / 1000.0, 4)
+    out = {"min_action_interval": 0.001,
+           "after_page_key_release": round((f + 2.0) / 1000.0, 4)}
+    for k in ("pluck_hold", "fret_click_hold", "select_click_hold",
+              "strum_click_hold", "page_key_hold", "page_turn_gap", "repluck_gap"):
+        out[k] = hold
+    return out
+
 
 # 从界面参数表移除、但编译核心仍会 `.get()` 读取的 3 个旧键：
 # 只保留默认值，保证 `Timing()` / `plan.py` 不 KeyError，且输出与旧版一致。

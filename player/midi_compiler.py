@@ -1559,7 +1559,7 @@ def compile_custom_role(song_or_path, role, custom_notes, timing=None, chord_sli
 def compile_file(path, role=ROLE_SOLO, timing=None, onbeat_rule="highest",
                  log=None, start_offset=None, enable_arpeggio=None, arpeggio_pattern=None,
                  enable_chord_rhythm=None, detail=False, want_analysis=False,
-                 chord_strum_mode=None):
+                 chord_strum_mode=None, max_prune_ratio=0.0):
     """编译一首 .mid（返回可以直接 json.dump 的 dict）。"""
     log = log or (lambda m: None)
     t = timing or Timing()
@@ -1606,7 +1606,9 @@ def compile_file(path, role=ROLE_SOLO, timing=None, onbeat_rule="highest",
         return got
 
     trimmed_accomp = 0
-    if role in (ROLE_DUET_RHYTHM, ROLE_DUET_RHYTHM_FRET):
+    prune_cap = int(max(0.0, min(0.15, float(max_prune_ratio or 0.0)))
+                    * max(1, len(notes)))
+    if prune_cap > 0 and role in (ROLE_DUET_RHYTHM, ROLE_DUET_RHYTHM_FRET):
         cur_notes = list(notes)
         for _round in range(3):
             if int(tl.get("stats", {}).get("late") or 0) <= 0:
@@ -1617,15 +1619,16 @@ def compile_file(path, role=ROLE_SOLO, timing=None, onbeat_rule="highest",
             tol = max(0.25, float(t.advance_need(1, True, True)))
             trimmed = [n for n in cur_notes if not any(
                 abs(float(n.get("t") or 0.0) - lt) <= tol for lt in lts)]
-            if len(trimmed) >= len(cur_notes):
+            removed = len(cur_notes) - len(trimmed)
+            if removed <= 0 or trimmed_accomp + removed > prune_cap:
                 break
             got = _run(trimmed)
             if got is None:
                 break
-            trimmed_accomp += len(cur_notes) - len(trimmed)
+            trimmed_accomp += removed
             cur_notes = trimmed
             tl = got
-    if role == ROLE_SOLO and int(tl.get("stats", {}).get("late") or 0) > 0:
+    if prune_cap > 0 and role == ROLE_SOLO and int(tl.get("stats", {}).get("late") or 0) > 0:
         def _is_melody(n):
             return bool(n.get("is_melody")) or n.get("src") == "melody"
 
@@ -1639,12 +1642,13 @@ def compile_file(path, role=ROLE_SOLO, timing=None, onbeat_rule="highest",
                 break
             trimmed = [n for n in cur_notes if _is_melody(n) or not any(
                 abs(float(n.get("t") or 0.0) - lt) <= window for lt in lts)]
-            if len(trimmed) >= len(cur_notes):
+            removed = len(cur_notes) - len(trimmed)
+            if removed <= 0 or trimmed_accomp + removed > prune_cap:
                 break
             got = _run(trimmed)
             if got is None or int(got.get("stats", {}).get("late") or 0) >= int(tl["stats"]["late"]):
                 break
-            trimmed_accomp += len(cur_notes) - len(trimmed)
+            trimmed_accomp += removed
             cur_notes = trimmed
             tl = got
     tl.setdefault("stats", {})["trimmed_accomp"] = trimmed_accomp
@@ -1653,6 +1657,35 @@ def compile_file(path, role=ROLE_SOLO, timing=None, onbeat_rule="highest",
             "（若游戏帧数充足，可在下方切换至「60 帧预设」或「90 帧预设」避免裁剪）"
             % trimmed_accomp)
     return tl
+
+
+def deduce_song_timing(path, role=ROLE_SOLO, max_prune_ratio=None, timing=None):
+    """从 33ms 向 11ms 试编译，取第一个 late=0 的最大帧长。"""
+    prune = 0.0 if max_prune_ratio is None else max(0.0, min(0.15, float(max_prune_ratio)))
+    best = None
+    tried = []
+    for frame in (33, 28, 24, 20, 16, 14, 11):
+        cand = Timing(player_config.build_timing_for_frame_ms(frame))
+        try:
+            tl = compile_file(path, role=role, timing=cand, max_prune_ratio=prune)
+            late = int((tl.get("stats") or {}).get("late") or 0)
+        except Exception:
+            continue
+        tried.append([frame, late])
+        if best is None or late < best[1]:
+            best = (frame, late)
+        if late == 0:
+            break
+    frame_ms, late = best if best else (33, None)
+    fps = max(30, min(90, int(round(1000.0 / frame_ms))))
+    return {
+        "frame_ms": float(frame_ms),
+        "recommend_fps": fps,
+        "timing": player_config.build_timing_for_frame_ms(frame_ms),
+        "max_prune_ratio": prune,
+        "late": late,
+        "tried": tried,
+    }
 
 
 def _wheel_hint(kind, page):

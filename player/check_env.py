@@ -81,7 +81,9 @@ def _gpu():
         info["bf16"] = bool(p.get("bf16"))
         info["fp16"] = bool(p.get("cuda") or p.get("xpu"))
         best = (p.get("best") or "cpu").lower()
-        info["backend"] = {"xpu": "XPU (Intel Arc)", "cuda": "CUDA (NVIDIA)",
+        vendor = (p.get("vendor") or "").lower()
+        info["backend"] = {"xpu": "XPU (Intel Arc)",
+                           "cuda": ("ROCm (AMD)" if vendor == "amd" else "CUDA (NVIDIA)"),
                            "cpu": "CPU"}.get(best, best.upper())
         if not info["name"]:
             try:
@@ -116,10 +118,12 @@ def _gpu():
                     info["hint"] = ("检测到 NVIDIA 显卡，但当前 torch 是 CPU 版；"
                                     "请在 setup 目录运行 setup_env.ps1 -Backend cuda 重装推理环境。")
             elif "intel" in low:
-                info["hint"] = ("检测到 Intel 显卡，但 XPU 不可用；"
-                                "请安装 Intel Arc 驱动，再运行 setup\setup_env.ps1 -Backend xpu。")
+                info["hint"] = ("当前环境为 CPU 版 PyTorch 或 XPU 未就绪，"
+                                "可点下方「一键安装 / 修复环境」配置 XPU 加速。")
             elif "amd" in low or "radeon" in low:
-                info["hint"] = "检测到 AMD 显卡：使用 CPU 转录（一首歌约 2~4 分钟，属正常）。"
+                info["hint"] = ("检测到 AMD 显卡：Windows 的 ROCm 版 PyTorch 只支持 Python 3.12，"
+                                "当前推理环境是 3.11，先用 CPU 转录；"
+                                "要用 A 卡加速见 setup\\setup_env.ps1 -Backend rocm。")
     except Exception as exc:  # noqa: BLE001
         info["error"] = "%s: %s" % (type(exc).__name__, exc)
     return info
